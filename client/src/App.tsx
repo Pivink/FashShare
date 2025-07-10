@@ -1,4 +1,3 @@
-// src/App.js
 import React from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { ThemeProvider } from './contexts/ThemeContext';
@@ -9,7 +8,6 @@ import LandingPage from './pages/LandingPage';
 import AboutPage from './pages/AboutPage';
 import ContactPage from './pages/ContactPage';
 import FileSharePage from './pages/FileSharePage';
-import JoinRoomPage from './pages/JoinRoomPage'; // Add this import
 
 function App() {
   return (
@@ -24,8 +22,6 @@ function App() {
                 <Route path="/about" element={<AboutPage />} />
                 <Route path="/contact" element={<ContactPage />} />
                 <Route path="/share" element={<FileSharePage />} />
-                {/* Add this new route */}
-                <Route path="/join/:roomId" element={<JoinRoomPage />} />
               </Routes>
             </main>
             <Footer />

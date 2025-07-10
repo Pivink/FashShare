@@ -137,6 +137,7 @@ io.on('connection', (socket) => {
   // File offer (metadata only)
   socket.on('file:offer', (data) => {
     const { roomId, fileName, fileSize, fileId = uuidv4() } = data;
+    console.log("File offered by client: ",data);
     const room = rooms.get(roomId);
     
     if (room && room.users.has(socket.id)) {
