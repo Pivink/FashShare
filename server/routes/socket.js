@@ -1,9 +1,9 @@
 import * as roomController from '../controllers/room.js';
-// import * as userController from '../controllers/';
 import * as transferController from '../controllers/transfer.js';
 import * as signalingController from '../controllers/signaling.js';
 import { startHeartbeat } from '../utils/heartbeat.js';
-import { createUser, deleteUser } from '../stores/users.js';
+import { createUser, deleteUser, getUser } from '../stores/users.js';
+import { getRoom, deleteRoom } from '../stores/rooms.js';
 
 export default (io) => {
   io.on('connection', (socket) => {
@@ -34,7 +34,7 @@ export default (io) => {
           roomId
         });
       } else {
-        socket.emit('room:error', { message: 'Room not found' });
+        socket.emit('room:error', { message: 'Room not found or expired' });
       }
     });
     
@@ -49,7 +49,10 @@ export default (io) => {
     socket.on('file:request', (data) => {
       const result = transferController.handleFileRequest(socket, data);
       if (result) {
-        socket.to(result.senderId).emit('file:requested', result);
+        socket.to(result.senderId).emit('file:requested', {
+          ...result,
+          senderId: result.senderId
+        });
       }
     });
     
@@ -64,6 +67,13 @@ export default (io) => {
       const result = transferController.handleTransferComplete(socket, data.fileId);
       if (result) {
         socket.to(result.senderId).emit('transfer:complete', result);
+        
+        // One-time download cleanup:
+        const room = getRoom(result.roomId);
+        if (room && room.oneTimeDownload) {
+          io.to(result.roomId).emit('room:destroyed', { message: 'One-time download completed. Room destroyed.' });
+          deleteRoom(result.roomId);
+        }
       }
     });
     
@@ -75,7 +85,6 @@ export default (io) => {
       console.log(`User disconnected (${reason}):`, socket.id);
       clearInterval(heartbeatInterval);
       
-      // Remove from all rooms
       const user = getUser(socket.id);
       if (user) {
         user.rooms.forEach(roomId => {

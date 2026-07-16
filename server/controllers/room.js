@@ -1,3 +1,4 @@
+import { v4 as uuidv4 } from 'uuid';
 import {
   createRoom,
   addUserToRoom,
@@ -5,11 +6,14 @@ import {
   getRoom,
   removeUserFromRoom
 } from '../stores/rooms.js';
-import { getUser } from '../stores/users.js';
+import { getUser, addRoomToUser, removeRoomFromUser } from '../stores/users.js';
 
 export const handleCreateRoom = (socket, roomData) => {
   const roomId = uuidv4();
-  const room = createRoom(roomId, roomData.name, socket.id);
+  const room = createRoom(roomId, roomData.name, socket.id, {
+    expiresAfter: roomData.expiresAfter,
+    oneTimeDownload: roomData.oneTimeDownload
+  });
   
   socket.join(roomId);
   addRoomToUser(socket.id, roomId);
@@ -34,7 +38,8 @@ export const handleJoinRoom = (socket, roomId) => {
   
   return {
     room: getRoomSummary(room),
-    users: roomUsers
+    users: roomUsers,
+    offers: room.offers || []
   };
 };
 

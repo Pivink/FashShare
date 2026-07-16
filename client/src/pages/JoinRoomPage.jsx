@@ -1,100 +1,911 @@
-// src/pages/JoinRoomPage.jsx
-import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useParams } from 'react-router-dom';
+import { Upload, Link, Users, Send, X, Download, Check, XCircle, Shield, Key, Sparkles, Clock } from 'lucide-react';
+import QRCode from 'qrcode';
 import { useTheme } from '../contexts/ThemeContext';
 import { useSocket } from '../contexts/SocketContext';
+import {
+  calculateHash,
+  deriveKeyFromPassword,
+  encryptBuffer,
+  decryptBuffer,
+  compressBuffer,
+  decompressBuffer,
+  shouldCompress
+} from '../utils/crypto';
+
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ]
+};
+
+const CHUNK_SIZE = 250 * 1024; // 250KB chunks (leaves room for header under 256KB max-message-size)
+
+// Convert ArrayBuffer to Hex String
+const bufToHex = (buffer) => {
+  return Array.from(new Uint8Array(buffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+// Convert Hex String to ArrayBuffer
+const hexToBuf = (hex) => {
+  if (!hex || typeof hex !== 'string') return new ArrayBuffer(0);
+  const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+  return bytes.buffer;
+};
 
 const JoinRoomPage = () => {
-    console.log("Join route")
   const { roomId } = useParams();
-  const navigate = useNavigate();
   const { theme } = useTheme();
-  const { socket, connected, user, joinAsUser, joinRoom, currentRoom } = useSocket();
+  const {
+    socket,
+    connected,
+    user,
+    joinAsUser,
+    joinRoom,
+    createRoom,
+    currentRoom,
+    roomUsers,
+    roomError
+  } = useSocket();
+
+  // State for user/room forms
   const [userName, setUserName] = useState(user?.name || '');
+  const [roomName, setRoomName] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [isJoining, setIsJoining] = useState(false);
 
-  useEffect(() => {
-    if (connected) {
-      setLoading(false);
-      
-      // If user is already authenticated, join room immediately
-      if (user) {
-        handleRoomJoin();
+  // File sharing state
+  const [dragActive, setDragActive] = useState(false);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [qrCodeUrl, setQrCodeUrl] = useState('');
+  const [shareUrl, setShareUrl] = useState('');
+  const [transferProgress, setTransferProgress] = useState(0);
+  const [transferStatus, setTransferStatus] = useState('');
+  const [fileShared, setFileShared] = useState(false);
+  const [offeredFiles, setOfferedFiles] = useState([]);
+  const [myOfferedFiles, setMyOfferedFiles] = useState([]);
+  const [pendingRequests, setPendingRequests] = useState([]);
+
+  // Create room options (if room doesn't exist)
+  const [expiresAfter, setExpiresAfter] = useState('0');
+  const [oneTimeDownload, setOneTimeDownload] = useState(false);
+
+  // Encryption / Password state
+  const [password, setPassword] = useState('');
+  const [isPasswordProtected, setIsPasswordProtected] = useState(false);
+  const [receiverPassword, setReceiverPassword] = useState('');
+  const [showPasswordPrompt, setShowPasswordPrompt] = useState(false);
+  const [selectedFileToDownload, setSelectedFileToDownload] = useState(null);
+
+  const fileInputRef = useRef(null);
+  const pcRef = useRef(null);           // RTCPeerConnection
+  const dcRef = useRef(null);           // RTCDataChannel
+  const receivingFileRef = useRef(null);
+  const receivedChunksRef = useRef([]);
+  const candidateQueueRef = useRef([]);
+  const socketRef = useRef(socket);
+
+  // Encryption keys & prepared send buffer
+  const senderBufferRef = useRef(null);
+  const fileMetaRef = useRef(null);
+
+  // Speed, remaining time, and pause/resume states
+  const [transferSpeed, setTransferSpeed] = useState('');
+  const [timeRemaining, setTimeRemaining] = useState('');
+  const [timeElapsed, setTimeElapsed] = useState('');
+  const [isPaused, setIsPaused] = useState(false);
+  const isPausedRef = useRef(false);
+  const startTimeRef = useRef(null);
+  const pauseTimeRef = useRef(null);
+  const [isTransferring, setIsTransferring] = useState(false);
+
+  // Keep socketRef current
+  useEffect(() => { socketRef.current = socket; }, [socket]);
+
+  // Helper: close any existing peer connection
+  const closePc = () => {
+    if (dcRef.current) { try { dcRef.current.close(); } catch(e){} dcRef.current = null; }
+    if (pcRef.current) { try { pcRef.current.close(); } catch(e){} pcRef.current = null; }
+    candidateQueueRef.current = [];
+    resetTransferStats();
+  };
+
+  const resetTransferStats = () => {
+    setTransferSpeed('');
+    setTimeRemaining('');
+    setTimeElapsed('');
+    setIsPaused(false);
+    isPausedRef.current = false;
+    startTimeRef.current = null;
+    pauseTimeRef.current = null;
+    setIsTransferring(false);
+    setTransferProgress(0);
+  };
+
+  const handlePauseToggle = () => {
+    const dc = dcRef.current;
+    if (!dc || dc.readyState !== 'open') return;
+    
+    const nextState = !isPausedRef.current;
+    isPausedRef.current = nextState;
+    setIsPaused(nextState);
+    
+    if (nextState) {
+      pauseTimeRef.current = Date.now();
+    } else {
+      if (pauseTimeRef.current && startTimeRef.current) {
+        const pauseDuration = Date.now() - pauseTimeRef.current;
+        startTimeRef.current += pauseDuration;
       }
     }
-  }, [connected, user]);
+    
+    dc.send(JSON.stringify({
+      type: nextState ? 'pause' : 'resume'
+    }));
+  };
+
+  const showUserForm = !user;
+  const showRoomForm = user && !currentRoom;
+
+  // --- Socket listeners for file transfer ---
+  useEffect(() => {
+    if (!socket) return;
+    console.log('Setting up file transfer listeners...');
+
+    const onFileOffered = (data) => {
+      setOfferedFiles(prev => {
+        if (prev.some(f => (f.fileId || f.id) === data.fileId)) return prev;
+        return [...prev, {
+          id: data.fileId,
+          name: data.fileName,
+          size: data.fileSize,
+          senderId: data.senderId,
+          senderName: data.senderName,
+          // Encrypted transfer metadata
+          isPasswordProtected: data.isPasswordProtected,
+          isCompressed: data.isCompressed,
+          fileHash: data.fileHash,
+          salt: data.salt,
+          iv: data.iv
+        }];
+      });
+      setTransferStatus(`New file available: ${data.fileName} from ${data.senderName}`);
+    };
+
+    const onRoomJoined = (data) => {
+      console.log('Room joined with offers:', data.offers);
+      if (data.offers && Array.isArray(data.offers)) {
+        setOfferedFiles(data.offers.map(o => ({
+          id: o.fileId,
+          name: o.fileName,
+          size: o.fileSize,
+          senderId: o.senderId,
+          senderName: o.senderName,
+          isPasswordProtected: o.isPasswordProtected,
+          isCompressed: o.isCompressed,
+          fileHash: o.fileHash,
+          salt: o.salt,
+          iv: o.iv
+        })));
+      }
+    };
+
+    const onFileRequested = (data) => {
+      console.log('File requested:', data);
+      setTransferStatus(`File requested by ${data.requesterName}`);
+      setPendingRequests(prev => {
+        if (prev.some(r => r.fileId === data.fileId && r.requesterId === data.requesterId)) return prev;
+        return [...prev, {
+          fileId: data.fileId,
+          requesterId: data.requesterId,
+          requesterName: data.requesterName,
+        }];
+      });
+    };
+
+    // Receiver gets the offer from sender
+    const onRtcOffer = async (data) => {
+      console.log('RTC offer received from', data.sender);
+      const receivingFile = receivingFileRef.current;
+      if (!receivingFile) {
+        console.warn('Got RTC offer but not waiting for any file – ignoring');
+        return;
+      }
+
+      closePc();
+      
+      if (!receivedChunksRef.current || receivedChunksRef.current.length === 0) {
+        receivedChunksRef.current = [];
+      }
+
+      const pc = new RTCPeerConnection(ICE_SERVERS);
+      pcRef.current = pc;
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) {
+          socketRef.current?.emit('rtc:ice-candidate', { target: data.sender, candidate: e.candidate });
+        }
+      };
+
+      pc.ondatachannel = (e) => {
+        const dc = e.channel;
+        dc.binaryType = 'arraybuffer';
+        dcRef.current = dc;
+        console.log('Data channel received:', dc.label);
+
+        dc.onmessage = async (evt) => {
+          if (typeof evt.data === 'string') {
+            try {
+              const msg = JSON.parse(evt.data);
+              
+              if (msg.type === 'meta') {
+                console.log('Received file metadata via WebRTC:', msg);
+                fileMetaRef.current = msg;
+                setIsTransferring(true);
+                startTimeRef.current = Date.now();
+                
+                if (receivedChunksRef.current.length === 0) {
+                  receivedChunksRef.current = new Array(msg.totalChunks);
+                }
+                
+                let firstMissingIdx = 0;
+                while (firstMissingIdx < msg.totalChunks && receivedChunksRef.current[firstMissingIdx] !== undefined) {
+                  firstMissingIdx++;
+                }
+                
+                dc.send(JSON.stringify({
+                  type: 'ready',
+                  nextChunkIndex: firstMissingIdx
+                }));
+                
+                setTransferStatus(`Connected. Starting download from chunk ${firstMissingIdx}...`);
+                return;
+              }
+              
+              if (msg.type === 'check_complete') {
+                console.log('Sender finished sending. Verifying chunk integrity...');
+                const missingIndices = [];
+                const total = receivedChunksRef.current.length;
+                for (let i = 0; i < total; i++) {
+                  if (receivedChunksRef.current[i] === undefined) {
+                    missingIndices.push(i);
+                  }
+                }
+                
+                if (missingIndices.length > 0) {
+                  console.warn('Missing chunks found:', missingIndices);
+                  setTransferStatus(`Recovering ${missingIndices.length} missing chunks...`);
+                  dc.send(JSON.stringify({
+                    type: 'resend_chunks',
+                    indices: missingIndices
+                  }));
+                } else {
+                  console.log('All chunks verified. Assembling file...');
+                  setTransferStatus('Decrypting and verifying file integrity...');
+                  dc.send(JSON.stringify({ type: 'transfer_complete' }));
+                  
+                  await assembleAndSaveFile();
+                }
+                return;
+              }
+
+              if (msg.type === 'pause') {
+                console.log('Pause requested by remote peer');
+                isPausedRef.current = true;
+                setIsPaused(true);
+                pauseTimeRef.current = Date.now();
+                return;
+              }
+              if (msg.type === 'resume') {
+                console.log('Resume requested by remote peer');
+                isPausedRef.current = false;
+                setIsPaused(false);
+                if (pauseTimeRef.current && startTimeRef.current) {
+                  const pauseDuration = Date.now() - pauseTimeRef.current;
+                  startTimeRef.current += pauseDuration;
+                }
+                return;
+              }
+            } catch (err) {
+              console.error('Error parsing text channel message:', err);
+            }
+          } else {
+            const view = new DataView(evt.data);
+            const chunkIndex = view.getUint32(0);
+            const totalChunks = view.getUint32(4);
+            const chunkData = evt.data.slice(8);
+
+            receivedChunksRef.current[chunkIndex] = chunkData;
+
+            const receivedCount = receivedChunksRef.current.filter(c => c !== undefined).length;
+            
+            // Calculate & update speed/stats
+            if (startTimeRef.current) {
+              const elapsed = (Date.now() - startTimeRef.current) / 1000;
+              if (elapsed > 0.1 && receivedCount % 5 === 0) {
+                const bytesReceived = receivedCount * CHUNK_SIZE;
+                const speedBytes = bytesReceived / elapsed;
+                
+                let speedStr = '';
+                if (speedBytes > 1024 * 1024) {
+                  speedStr = `${(speedBytes / (1024 * 1024)).toFixed(2)} MB/s`;
+                } else {
+                  speedStr = `${(speedBytes / 1024).toFixed(1)} KB/s`;
+                }
+                setTransferSpeed(speedStr);
+                setTimeElapsed(`${Math.round(elapsed)}s elapsed`);
+                
+                if (speedBytes > 0) {
+                  const remainingBytes = (totalChunks - receivedCount) * CHUNK_SIZE;
+                  const remSecs = Math.round(remainingBytes / speedBytes);
+                  setTimeRemaining(`${remSecs}s remaining`);
+                }
+              }
+            }
+
+            const progress = Math.round((receivedCount / totalChunks) * 100);
+            setTransferProgress(prev => prev !== progress ? progress : prev);
+            setTransferStatus(`Downloading: ${progress}% (${receivedCount}/${totalChunks} chunks)`);
+          }
+        };
+
+        dc.onopen = () => {
+          console.log('Data channel open – ready to receive');
+          setTransferStatus('Connected – exchanging metadata…');
+        };
+
+        dc.onerror = (err) => {
+          const errorMsg = err?.error?.message || err?.message || '';
+          if (errorMsg.includes('Close called') || errorMsg.includes('User-Initiated Abort')) {
+            console.log('Data channel closed cleanly by user cancellation.');
+          } else {
+            console.error('Data channel error:', err);
+            setTransferStatus('Transfer error');
+          }
+          closePc();
+        };
+
+        dc.onclose = () => {
+          console.log('Data channel closed');
+          setTransferStatus('Connection closed');
+          closePc();
+        };
+      };
+
+      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+
+      // Flush queued candidates
+      for (const c of candidateQueueRef.current) {
+        await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
+      }
+      candidateQueueRef.current = [];
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socketRef.current?.emit('rtc:answer', { target: data.sender, sdp: pc.localDescription });
+    };
+
+    // Sender gets the WebRTC answer from receiver
+    const onRtcAnswer = async (data) => {
+      console.log('RTC answer received from', data.sender);
+      const pc = pcRef.current;
+      if (!pc) { console.warn('Got answer but no peer connection exists'); return; }
+      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp)).catch(console.error);
+
+      // Flush queued candidates
+      for (const c of candidateQueueRef.current) {
+        await pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.warn);
+      }
+      candidateQueueRef.current = [];
+    };
+
+    const onRtcIceCandidate = async (data) => {
+      const pc = pcRef.current;
+      if (pc && pc.remoteDescription) {
+        await pc.addIceCandidate(new RTCIceCandidate(data.candidate)).catch(console.warn);
+      } else {
+        candidateQueueRef.current.push(data.candidate);
+      }
+    };
+
+    const onTransferProgress = (data) => {
+      setTransferProgress(data.progress);
+      setTransferStatus(`Transfer progress: ${data.progress}%`);
+    };
+
+    socket.on('file:offered', onFileOffered);
+    socket.on('room:joined', onRoomJoined);
+    socket.on('file:requested', onFileRequested);
+    socket.on('transfer:progress', onTransferProgress);
+    socket.on('rtc:offer', onRtcOffer);
+    socket.on('rtc:answer', onRtcAnswer);
+    socket.on('rtc:ice-candidate', onRtcIceCandidate);
+
+    return () => {
+      socket.off('file:offered', onFileOffered);
+      socket.off('room:joined', onRoomJoined);
+      socket.off('file:requested', onFileRequested);
+      socket.off('transfer:progress', onTransferProgress);
+      socket.off('rtc:offer', onRtcOffer);
+      socket.off('rtc:answer', onRtcAnswer);
+      socket.off('rtc:ice-candidate', onRtcIceCandidate);
+    };
+  }, [socket]);
+
+  // Reset share state when room changes – but preserve offeredFiles
+  useEffect(() => {
+    if (currentRoom) {
+      setShareUrl('');
+      setQrCodeUrl('');
+      setFileShared(false);
+      closePc();
+      receivingFileRef.current = null;
+      receivedChunksRef.current = [];
+    }
+  }, [currentRoom]);
+
+  // --- Join room logic ---
+  useEffect(() => {
+    if (roomError) {
+      setError(roomError.message || 'Failed to join room');
+      setIsJoining(false);
+    }
+  }, [roomError]);
 
   useEffect(() => {
-    if (currentRoom?.id === roomId) {
-      // Redirect to share page after successful join
-      navigate('/share');
-    }
-  }, [currentRoom, roomId, navigate]);
+    if (connected) setLoading(false);
+  }, [connected]);
 
-  const handleRoomJoin = () => {
-    if (!roomId) {
-      setError('Invalid room ID');
-      return;
-    }
-    
+  const performJoin = useCallback(() => {
+    if (!roomId) { setError('Invalid room ID'); setIsJoining(false); return; }
     setIsJoining(true);
     joinRoom(roomId);
-  };
+  }, [roomId, joinRoom]);
+
+  useEffect(() => {
+    if (user && connected && roomId && !currentRoom) performJoin();
+  }, [user, connected, roomId, currentRoom, performJoin]);
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    
-    if (!userName.trim()) {
-      setError('Please enter your name');
-      return;
-    }
-    
-    if (!user) {
-      joinAsUser(userName.trim());
-    }
-    
-    handleRoomJoin();
+    setError('');
+    if (!userName.trim()) { setError('Please enter your name'); return; }
+    if (!user) joinAsUser(userName.trim());
+    performJoin();
   };
 
-  if (loading) {
+  // --- File Assembly & Decryption (Receiver) ---
+  const assembleAndSaveFile = async () => {
+    try {
+      const file = receivingFileRef.current;
+      const chunks = receivedChunksRef.current;
+      
+      const totalLength = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+      const combinedBuffer = new Uint8Array(totalLength);
+      
+      let offset = 0;
+      for (const chunk of chunks) {
+        combinedBuffer.set(new Uint8Array(chunk), offset);
+        offset += chunk.byteLength;
+      }
+      
+      let finalBuffer = combinedBuffer.buffer;
+      
+      setTransferStatus('Decrypting secure file end-to-end...');
+      const iv = hexToBuf(file.iv);
+      let key;
+      
+      if (file.isPasswordProtected) {
+        const salt = hexToBuf(file.salt);
+        key = await deriveKeyFromPassword(receiverPassword, salt);
+      } else {
+        const dummySalt = new Uint8Array(16);
+        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt);
+      }
+      
+      try {
+        finalBuffer = await decryptBuffer(finalBuffer, key, iv);
+      } catch (err) {
+        console.error('Decryption failed:', err);
+        setTransferStatus('Error: Incorrect password or corrupted data. Decryption failed.');
+        setTransferProgress(0);
+        return;
+      }
+      
+      if (file.isCompressed) {
+        setTransferStatus('Decompressing file contents...');
+        try {
+          finalBuffer = await decompressBuffer(finalBuffer);
+        } catch (err) {
+          console.error('Decompression failed:', err);
+          setTransferStatus('Error: Decompression failed.');
+          return;
+        }
+      }
+      
+      setTransferStatus('Verifying file integrity...');
+      const receivedHash = await calculateHash(finalBuffer);
+      if (receivedHash !== file.fileHash) {
+        console.error('Hash mismatch! File integrity compromised.');
+        setTransferStatus('Error: Integrity check failed (SHA-256 mismatch).');
+        return;
+      }
+      
+      setTransferStatus('Saving file...');
+      const blob = new Blob([finalBuffer]);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.name || 'downloaded_file';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      setTransferProgress(100);
+      setTransferStatus('Transfer and verification completed successfully!');
+      socketRef.current?.emit('transfer:complete', { fileId: file.id });
+      
+      setTimeout(() => {
+        setTransferProgress(0);
+        setTransferStatus('');
+        setActivePeer(null);
+      }, 3000);
+      
+      receivedChunksRef.current = [];
+      receivingFileRef.current = null;
+      closePc();
+      
+    } catch (error) {
+      console.error('Assemble file error:', error);
+      setTransferStatus('Error during file assembly: ' + error.message);
+    }
+  };
+
+  // --- File sharing handlers ---
+  const generateQRCode = async (url) => {
+    try {
+      const qrCodeDataUrl = await QRCode.toDataURL(url);
+      setQrCodeUrl(qrCodeDataUrl);
+    } catch (error) {
+      console.error('Error generating QR code:', error);
+    }
+  };
+
+  const handleDrag = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    setDragActive(e.type === 'dragenter' || e.type === 'dragover');
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault(); e.stopPropagation();
+    setDragActive(false);
+    if (e.dataTransfer.files?.[0]) {
+      setSelectedFile(e.dataTransfer.files[0]);
+      setShareUrl(''); setQrCodeUrl(''); setFileShared(false);
+    }
+  };
+
+  const handleFileSelect = (e) => {
+    if (e.target.files?.[0]) {
+      setSelectedFile(e.target.files[0]);
+      setShareUrl(''); setQrCodeUrl(''); setFileShared(false);
+    }
+  };
+
+  // Sender: Prepare & Share file
+  const handleFileOffer = async () => {
+    if (!selectedFile) { setTransferStatus('No file selected'); return; }
+    if (!currentRoom?.id) { setTransferStatus('Room is not ready.'); return; }
+
+    setTransferStatus('Encrypting and compressing file...');
+    setTransferProgress(10);
+    
+    try {
+      const originalBuffer = await selectedFile.arrayBuffer();
+      const fileHash = await calculateHash(originalBuffer);
+      
+      let finalBuffer = originalBuffer;
+      let isCompressed = false;
+      
+      if (shouldCompress(selectedFile.name)) {
+        const compressed = await compressBuffer(originalBuffer);
+        if (compressed.byteLength < originalBuffer.byteLength * 0.95) {
+          finalBuffer = compressed;
+          isCompressed = true;
+        }
+      }
+      
+      let salt = null;
+      let key;
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      
+      if (isPasswordProtected && password) {
+        salt = crypto.getRandomValues(new Uint8Array(16));
+        key = await deriveKeyFromPassword(password, salt);
+      } else {
+        const dummySalt = new Uint8Array(16);
+        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt);
+      }
+      
+      const encryptedBuffer = await encryptBuffer(finalBuffer, key, iv);
+      senderBufferRef.current = encryptedBuffer;
+
+      const fileId = Date.now().toString();
+      
+      setMyOfferedFiles(prev => [...prev, {
+        id: fileId,
+        file: selectedFile,
+        name: selectedFile.name,
+        size: selectedFile.size
+      }]);
+      
+      const offerPayload = {
+        roomId: currentRoom.id,
+        fileName: selectedFile.name,
+        fileSize: selectedFile.size,
+        fileId,
+        isPasswordProtected: isPasswordProtected && !!password,
+        salt: salt ? bufToHex(salt) : null,
+        iv: bufToHex(iv),
+        isCompressed,
+        fileHash,
+        oneTimeDownload
+      };
+      
+      socket.emit('file:offer', offerPayload);
+      
+      setTransferProgress(100);
+      setTransferStatus(`File ready for sharing: ${selectedFile.name}`);
+      const url = `${window.location.origin}/join/${currentRoom.id}`;
+      setShareUrl(url);
+      generateQRCode(url);
+      setFileShared(true);
+      
+    } catch (err) {
+      console.error('File encryption failed:', err);
+      setTransferStatus('Failed to encrypt file: ' + err.message);
+      setTransferProgress(0);
+    }
+  };
+
+  // Receiver: Click Download
+  const handleFileRequest = (fileId, senderId) => {
+    if (!socket) return;
+    const file = offeredFiles.find(f => f.id === fileId);
+    if (!file) return;
+    
+    if (file.isPasswordProtected) {
+      setSelectedFileToDownload(file);
+      setReceiverPassword('');
+      setShowPasswordPrompt(true);
+    } else {
+      startDownloadRequest(file);
+    }
+  };
+
+  const startDownloadRequest = (file) => {
+    receivingFileRef.current = file;
+    socket.emit('file:request', { fileId: file.id, candidateId: socket.id });
+    setTransferStatus(`Requesting connection to sender for ${file.name}...`);
+  };
+
+  const handlePasswordSubmit = (e) => {
+    e.preventDefault();
+    if (!receiverPassword.trim()) return;
+    
+    setShowPasswordPrompt(false);
+    if (selectedFileToDownload) {
+      startDownloadRequest(selectedFileToDownload);
+    }
+  };
+
+  // Sender: accept a download request
+  const handleAcceptRequest = async (request) => {
+    const myFile = myOfferedFiles.find(f => f.id === request.fileId);
+    if (!myFile) { setTransferStatus('File not found in your offered files'); return; }
+
+    setPendingRequests(prev => prev.filter(r => !(r.fileId === request.fileId && r.requesterId === request.requesterId)));
+
+    console.log('Creating native RTCPeerConnection as initiator for', request.requesterName);
+    closePc();
+
+    const pc = new RTCPeerConnection(ICE_SERVERS);
+    pcRef.current = pc;
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        socket.emit('rtc:ice-candidate', { target: request.requesterId, candidate: e.candidate });
+      }
+    };
+
+    const dc = pc.createDataChannel('fileTransfer', { ordered: true });
+    dcRef.current = dc;
+    dc.binaryType = 'arraybuffer';
+
+    dc.onopen = () => {
+      console.log('Data channel open – sending file metadata');
+      setTransferStatus('Connected – exchanging protocol meta…');
+      
+      const buffer = senderBufferRef.current;
+      if (buffer) {
+        const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
+        console.log(`Sending meta to receiver: fileId=${request.fileId}, totalChunks=${totalChunks}`);
+        dc.send(JSON.stringify({
+          type: 'meta',
+          fileId: request.fileId,
+          totalChunks
+        }));
+      } else {
+        console.error('No prepared encrypted buffer found to send in onopen');
+      }
+    };
+
+    dc.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'ready') {
+          console.log(`Receiver is ready! Starting chunk send from index: ${msg.nextChunkIndex}`);
+          setTransferStatus('Sending file chunks...');
+          sendFileChunks(dc, msg.nextChunkIndex, request.fileId);
+        }
+        if (msg.type === 'resend_chunks') {
+          console.log('Receiver requested resend of chunks:', msg.indices);
+          resendChunks(dc, msg.indices);
+        }
+        if (msg.type === 'transfer_complete') {
+          console.log('Receiver successfully assembled and downloaded the file.');
+          setTransferStatus('File transferred successfully!');
+          setTransferProgress(100);
+          closePc();
+        }
+      } catch (err) {
+        console.error('Error parsing client ready state:', err);
+      }
+    };
+
+    dc.onerror = (err) => {
+      console.error('Data channel error:', err);
+      setTransferStatus('Transfer error');
+    };
+
+    dc.onclose = () => console.log('Data channel closed');
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit('rtc:offer', { target: request.requesterId, sdp: pc.localDescription });
+    setTransferStatus('Waiting for receiver to accept WebRTC connection…');
+  };
+
+  const sendFileChunks = async (dc, startIndex, fileId) => {
+    const buffer = senderBufferRef.current;
+    if (!buffer) return;
+    
+    const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
+    
+    const LOW_WATER = 256 * 1024; // 256KB
+    const waitForDrain = () => new Promise(resolve => {
+      if (dc.bufferedAmount <= LOW_WATER) { resolve(); return; }
+      const check = () => {
+        if (dc.readyState !== 'open') { resolve(); return; }
+        if (dc.bufferedAmount <= LOW_WATER) { resolve(); }
+        else { setTimeout(check, 50); }
+      };
+      setTimeout(check, 50);
+    });
+
+    for (let index = startIndex; index < totalChunks; index++) {
+      if (dc.readyState !== 'open') return;
+      
+      await waitForDrain();
+      if (dc.readyState !== 'open') return;
+      
+      const offset = index * CHUNK_SIZE;
+      const size = Math.min(CHUNK_SIZE, buffer.byteLength - offset);
+      const chunkData = buffer.slice(offset, offset + size);
+      
+      const messageBuffer = new ArrayBuffer(8 + chunkData.byteLength);
+      const view = new DataView(messageBuffer);
+      view.setUint32(0, index);
+      view.setUint32(4, totalChunks);
+      
+      const payload = new Uint8Array(messageBuffer);
+      payload.set(new Uint8Array(chunkData), 8);
+      
+      dc.send(messageBuffer);
+      
+      const progress = Math.round((index / totalChunks) * 100);
+      setTransferProgress(progress);
+      if (progress % 5 === 0) {
+        socketRef.current?.emit('transfer:progress', { fileId, progress, direction: 'upload' });
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    
+    if (dc.readyState === 'open') {
+      dc.send(JSON.stringify({ type: 'check_complete' }));
+    }
+  };
+
+  // Resend chunks
+  const resendChunks = async (dc, indices) => {
+    const buffer = senderBufferRef.current;
+    if (!buffer) return;
+    
+    const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
+    
+    for (const index of indices) {
+      if (dc.readyState !== 'open') return;
+      
+      const offset = index * CHUNK_SIZE;
+      const size = Math.min(CHUNK_SIZE, buffer.byteLength - offset);
+      const chunkData = buffer.slice(offset, offset + size);
+      
+      const messageBuffer = new ArrayBuffer(8 + chunkData.byteLength);
+      const view = new DataView(messageBuffer);
+      view.setUint32(0, index);
+      view.setUint32(4, totalChunks);
+      
+      const payload = new Uint8Array(messageBuffer);
+      payload.set(new Uint8Array(chunkData), 8);
+      
+      dc.send(messageBuffer);
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    
+    if (dc.readyState === 'open') {
+      dc.send(JSON.stringify({ type: 'check_complete' }));
+    }
+  };
+
+  const handleRejectRequest = (request) => {
+    setPendingRequests(prev => prev.filter(r => !(r.fileId === request.fileId && r.requesterId === request.requesterId)));
+    setTransferStatus(`Rejected request from ${request.requesterName}`);
+  };
+
+  const copyShareUrl = () => {
+    if (!shareUrl) return;
+    navigator.clipboard?.writeText(shareUrl).catch(() => {
+      const tmp = document.createElement('input');
+      tmp.value = shareUrl;
+      document.body.appendChild(tmp);
+      tmp.select();
+      document.execCommand('copy');
+      document.body.removeChild(tmp);
+    });
+    setTransferStatus('Share URL copied!');
+  };
+
+  // --- Render ---
+  if (!connected) {
     return (
       <div className={`min-h-screen ${theme.background} flex items-center justify-center`}>
         <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4" />
           <p className={`${theme.text} text-lg`}>Connecting to server...</p>
         </div>
       </div>
     );
   }
 
-  return (
-    <div className={`min-h-screen ${theme.background} flex items-center justify-center`}>
-      <div className={`${theme.card} border rounded-xl p-8 max-w-md w-full mx-4`}>
-        <h2 className={`text-2xl font-bold ${theme.text} mb-6 text-center`}>
-          Join Room
-        </h2>
-        
-        {error && (
-          <div className={`mb-4 p-3 rounded-lg bg-red-100 text-red-800`}>
-            {error}
-          </div>
-        )}
-        
-        <p className={`${theme.text} mb-4 text-center`}>
-          You're joining room: <span className="font-mono bg-gray-100 px-2 py-1 rounded">{roomId}</span>
-        </p>
-        
-        {!user && (
+  if (showUserForm) {
+    return (
+      <div className={`min-h-screen ${theme.background} flex items-center justify-center`}>
+        <div className={`${theme.card} border rounded-xl p-8 max-w-md w-full mx-4 shadow-2xl`}>
+          <h2 className={`text-2xl font-bold ${theme.text} mb-6 text-center flex items-center justify-center gap-2`}>
+            <Sparkles className="text-blue-500" /> Join Secure Room
+          </h2>
           <form onSubmit={handleSubmit} className="space-y-4">
             <div>
-              <label htmlFor="userName" className={`block text-sm font-medium ${theme.text} mb-2`}>
-                Your Name
-              </label>
+              <label className={`block text-sm font-medium ${theme.text} mb-2`}>Your Name</label>
               <input
                 type="text"
-                id="userName"
                 value={userName}
                 onChange={(e) => setUserName(e.target.value)}
                 className={`w-full px-4 py-3 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
@@ -104,28 +915,413 @@ const JoinRoomPage = () => {
             </div>
             <button
               type="submit"
-              disabled={isJoining}
-              className={`w-full ${theme.primary} ${theme.text} py-3 px-6 rounded-lg font-semibold ${theme.hover} transition-all duration-300 disabled:opacity-50`}
+              className={`w-full ${theme.primary} ${theme.text} py-3 px-6 rounded-lg font-semibold ${theme.hover}`}
             >
-              {isJoining ? 'Joining...' : 'Join Room'}
+              Join ZepShare
             </button>
           </form>
-        )}
-        
-        {user && (
-          <div className="text-center">
-            <p className={`${theme.text} mb-4`}>
-              You're joining as: <span className="font-semibold">{user.name}</span>
-            </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (showRoomForm) {
+    return (
+      <div className={`min-h-screen ${theme.background} flex items-center justify-center`}>
+        <div className={`${theme.card} border rounded-xl p-8 max-w-md w-full mx-4 shadow-2xl space-y-4`}>
+          <h2 className={`text-2xl font-bold ${theme.text} text-center`}>Create a Room</h2>
+          <p className={`${theme.text} text-sm text-center`}>This room doesn't exist. Would you like to create it?</p>
+          <form onSubmit={(e) => { e.preventDefault(); createRoom({ name: roomName, expiresAfter: expiresAfter === '0' ? null : parseInt(expiresAfter), oneTimeDownload }); }} className="space-y-4">
+            <div>
+              <label className={`block text-sm font-medium ${theme.text} mb-2`}>Room Name</label>
+              <input
+                type="text"
+                value={roomName}
+                onChange={(e) => setRoomName(e.target.value)}
+                className={`w-full px-4 py-3 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                placeholder="Enter room name"
+                required
+              />
+            </div>
+            
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className={`block text-sm font-medium ${theme.text} mb-2 flex items-center gap-1`}>
+                  <Clock className="h-4 w-4 text-blue-500" /> Link Expiry
+                </label>
+                <select
+                  value={expiresAfter}
+                  onChange={(e) => setExpiresAfter(e.target.value)}
+                  className={`w-full px-3 py-2.5 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                >
+                  <option value="0">Never</option>
+                  <option value="5">5 Minutes</option>
+                  <option value="10">10 Minutes</option>
+                  <option value="60">1 Hour</option>
+                </select>
+              </div>
+              <div className="flex flex-col justify-end">
+                <label className={`flex items-center gap-2 cursor-pointer text-sm font-medium ${theme.text} mb-3`}>
+                  <input
+                    type="checkbox"
+                    checked={oneTimeDownload}
+                    onChange={(e) => setOneTimeDownload(e.target.checked)}
+                    className="h-4 w-4 text-blue-500 border-gray-300 rounded focus:ring-blue-500"
+                  />
+                  One-time Room
+                </label>
+              </div>
+            </div>
+
             <button
-              onClick={handleRoomJoin}
-              disabled={isJoining}
-              className={`w-full ${theme.primary} ${theme.text} py-3 px-6 rounded-lg font-semibold ${theme.hover} transition-all duration-300 disabled:opacity-50`}
+              type="submit"
+              className={`w-full ${theme.primary} ${theme.text} py-3 px-6 rounded-lg font-semibold ${theme.hover}`}
             >
-              {isJoining ? 'Joining...' : 'Join Room'}
+              Create Room
             </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`min-h-screen ${theme.background} pt-24 pb-12`}>
+      {/* Password Prompt modal */}
+      {showPasswordPrompt && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className={`${theme.card} border rounded-xl p-8 max-w-md w-full shadow-2xl relative space-y-4`}>
+            <button
+              onClick={() => setShowPasswordPrompt(false)}
+              className="absolute top-4 right-4 text-gray-500 hover:text-gray-700"
+            >
+              <X className="h-5 w-5" />
+            </button>
+            <h3 className={`text-xl font-bold ${theme.text} flex items-center gap-2`}>
+              <Shield className="text-red-500 h-5 w-5" /> Password Required
+            </h3>
+            <p className={`${theme.textSecondary} text-sm`}>
+              This file is protected with end-to-end encryption. Please enter the password to derive the decryption key.
+            </p>
+            <form onSubmit={handlePasswordSubmit} className="space-y-4">
+              <input
+                type="password"
+                value={receiverPassword}
+                onChange={(e) => setReceiverPassword(e.target.value)}
+                className={`w-full px-4 py-3 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                placeholder="Enter password"
+                required
+                autoFocus
+              />
+              <button
+                type="submit"
+                className={`w-full ${theme.primary} ${theme.text} py-3 rounded-lg font-semibold ${theme.hover}`}
+              >
+                Decrypt & Connect
+              </button>
+            </form>
           </div>
-        )}
+        </div>
+      )}
+
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          {/* Left Column: Upload & Available Files */}
+          <div className="lg:col-span-2 space-y-6">
+            {/* Sender Section */}
+            <div className={`${theme.card} border rounded-xl p-8 shadow-md`}>
+              <h2 className={`text-2xl font-bold ${theme.text} mb-6 flex items-center gap-2`}>
+                <Sparkles className="text-blue-500 h-6 w-6" /> Share Secure Files
+              </h2>
+              <div
+                className={`border-2 border-dashed rounded-lg p-8 text-center transition-all duration-300 ${
+                  dragActive ? `border-blue-500 bg-blue-50 ${theme.primary}` : `border-gray-300 ${theme.hover}`
+                }`}
+                onDragEnter={handleDrag}
+                onDragLeave={handleDrag}
+                onDragOver={handleDrag}
+                onDrop={handleDrop}
+              >
+                <Upload className={`h-12 w-12 ${theme.textSecondary} mx-auto mb-4`} />
+                <p className={`${theme.text} text-lg mb-2`}>Drag and drop your file here</p>
+                <p className={`${theme.textSecondary} mb-4`}>or click to select a file</p>
+                <input ref={fileInputRef} type="file" onChange={handleFileSelect} className="hidden" />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className={`${theme.primary} ${theme.text} px-6 py-2 rounded-lg font-semibold ${theme.hover}`}
+                >
+                  Select File
+                </button>
+              </div>
+
+              {selectedFile && (
+                <div className={`mt-6 p-6 ${theme.secondary} rounded-lg space-y-4`}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className={`${theme.text} font-semibold`}>{selectedFile.name}</p>
+                      <p className={`${theme.textSecondary} text-sm`}>{(selectedFile.size / 1024 / 1024).toFixed(2)} MB</p>
+                    </div>
+                    <button
+                      onClick={() => { setSelectedFile(null); setShareUrl(''); setQrCodeUrl(''); setFileShared(false); }}
+                      className={`${theme.card} border ${theme.textSecondary} p-2 rounded-lg ${theme.hover}`}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+
+                  <div className="border-t border-gray-700/50 pt-4 space-y-3">
+                    <label className={`flex items-center gap-2 cursor-pointer text-sm font-semibold ${theme.text}`}>
+                      <input
+                        type="checkbox"
+                        checked={isPasswordProtected}
+                        onChange={(e) => setIsPasswordProtected(e.target.checked)}
+                        className="h-4 w-4 text-blue-500 border-gray-300 rounded focus:ring-blue-500"
+                      />
+                      Add Password Security (E2E Decryption Key)
+                    </label>
+
+                    {isPasswordProtected && (
+                      <div className="relative">
+                        <Key className="absolute left-3 top-3 h-4 w-4 text-gray-500" />
+                        <input
+                          type="password"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          placeholder="Set file decryption password"
+                          className={`w-full pl-9 pr-4 py-2 rounded-lg border ${theme.card} ${theme.text} text-sm focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  <button
+                    onClick={handleFileOffer}
+                    className={`w-full ${theme.primary} ${theme.text} py-2.5 rounded-lg font-semibold ${theme.hover} flex items-center justify-center space-x-2`}
+                  >
+                    <Send className="h-4 w-4" />
+                    <span>Secure & Share File</span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Receiver Section: Available Files */}
+            {offeredFiles.filter(file => file.senderId !== socket?.id).length > 0 && (
+              <div className={`${theme.card} border rounded-xl p-8 shadow-md`}>
+                <h2 className={`text-2xl font-bold ${theme.text} mb-6`}>Available Secure Downloads</h2>
+                <div className="space-y-4">
+                  {offeredFiles.filter(file => file.senderId !== socket?.id).map(file => (
+                    <div key={file.id} className={`p-4 ${theme.secondary} rounded-lg flex items-center justify-between`}>
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <p className={`${theme.text} font-semibold`}>{file.name}</p>
+                          {file.isPasswordProtected && (
+                            <span className="bg-red-500/20 text-red-400 text-xs px-2 py-0.5 rounded-full flex items-center gap-1 font-medium">
+                              <Shield className="h-3 w-3" /> Password Protected
+                            </span>
+                          )}
+                        </div>
+                        <p className={`${theme.textSecondary} text-sm`}>
+                          {(file.size / 1024 / 1024).toFixed(2)} MB · from {file.senderName}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => handleFileRequest(file.id, file.senderId)}
+                        className={`${theme.primary} ${theme.text} px-4 py-2 rounded-lg font-semibold ${theme.hover} flex items-center space-x-2`}
+                      >
+                        <Download className="h-4 w-4" /><span>Download</span>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Pending Requests (only visible to sender) */}
+            {pendingRequests.length > 0 && (
+              <div className={`${theme.card} border rounded-xl p-8 shadow-md`}>
+                <h2 className={`text-2xl font-bold ${theme.text} mb-6`}>Pending Download Requests</h2>
+                <div className="space-y-4">
+                  {pendingRequests.map((req, idx) => (
+                    <div key={idx} className={`p-4 ${theme.secondary} rounded-lg flex items-center justify-between`}>
+                      <div>
+                        <p className={`${theme.text} font-semibold`}>{req.requesterName} wants to download a file</p>
+                        <p className={`${theme.textSecondary} text-sm`}>File ID: {req.fileId}</p>
+                      </div>
+                      <div className="flex space-x-2">
+                        <button
+                          onClick={() => handleAcceptRequest(req)}
+                          className="bg-green-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-green-700 flex items-center space-x-2"
+                        >
+                          <Check className="h-4 w-4" /><span>Accept</span>
+                        </button>
+                        <button
+                          onClick={() => handleRejectRequest(req)}
+                          className="bg-red-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-red-700 flex items-center space-x-2"
+                        >
+                          <XCircle className="h-4 w-4" /><span>Reject</span>
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Progress & Status */}
+            {/* Progress & Status */}
+            {(isTransferring || transferProgress > 0) && (
+              <div className="mt-6 p-6 rounded-2xl bg-gradient-to-br from-indigo-950/80 via-slate-900/90 to-purple-950/80 border border-indigo-500/30 backdrop-blur-xl shadow-2xl relative overflow-hidden">
+                {/* Glow decorations */}
+                <div className="absolute -top-12 -left-12 w-24 h-24 bg-indigo-500/20 rounded-full blur-2xl" />
+                <div className="absolute -bottom-12 -right-12 w-24 h-24 bg-purple-500/20 rounded-full blur-2xl" />
+
+                <div className="flex justify-between items-center text-sm mb-3">
+                  <div className="flex items-center space-x-2">
+                    <div className="w-2.5 h-2.5 bg-emerald-500 rounded-full animate-ping" />
+                    <span className="font-semibold text-indigo-200 tracking-wide uppercase text-xs">E2E Secure Link</span>
+                  </div>
+                  <span className="font-mono text-lg font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-indigo-300">
+                    {transferProgress}%
+                  </span>
+                </div>
+                
+                {/* Glowing thin luxury progress bar */}
+                <div className="w-full bg-slate-950/60 rounded-full h-1.5 mb-5 overflow-hidden border border-white/5 shadow-inner">
+                  <div
+                    className="bg-gradient-to-r from-cyan-500 via-indigo-500 to-purple-600 h-1.5 rounded-full transition-all duration-300 relative"
+                    style={{ width: `${transferProgress}%` }}
+                  >
+                    <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/40 to-transparent animate-pulse" />
+                  </div>
+                </div>
+
+                {/* Inline Luxury Metrics */}
+                <div className="flex flex-wrap items-center justify-between gap-y-2 text-xs text-slate-300 py-3 px-4 rounded-xl bg-black/45 border border-white/5 shadow-inner mb-5 font-medium">
+                  <div className="flex items-center space-x-1.5">
+                    <span className="text-cyan-400">⚡</span>
+                    <span>Speed: <strong className="text-white font-semibold">{transferSpeed || 'Connecting...'}</strong></span>
+                  </div>
+                  <div className="w-[1px] h-3 bg-white/10 hidden sm:block" />
+                  <div className="flex items-center space-x-1.5">
+                    <span className="text-indigo-400">⏱️</span>
+                    <span>Elapsed: <strong className="text-white font-semibold">{timeElapsed || '0s'}</strong></span>
+                  </div>
+                  <div className="w-[1px] h-3 bg-white/10 hidden sm:block" />
+                  <div className="flex items-center space-x-1.5">
+                    <span className="text-purple-400">⏳</span>
+                    <span>Time Left: <strong className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-300 to-cyan-300 font-bold">{timeRemaining || 'Estimating...'}</strong></span>
+                  </div>
+                </div>
+
+                {/* Control Actions */}
+                {transferProgress < 100 && (
+                  <div className="flex space-x-3 justify-center">
+                    <button
+                      onClick={handlePauseToggle}
+                      className={`px-5 py-2 rounded-xl text-xs font-bold flex items-center space-x-2 transition-all shadow-md transform active:scale-95 ${
+                        isPaused 
+                          ? 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-950/20' 
+                          : 'bg-amber-600 hover:bg-amber-700 text-white shadow-amber-950/20'
+                      }`}
+                    >
+                      {isPaused ? (
+                        <>
+                          <Check className="h-3.5 w-3.5" />
+                          <span>Resume Link</span>
+                        </>
+                      ) : (
+                        <>
+                          <X className="h-3.5 w-3.5" />
+                          <span>Pause Link</span>
+                        </>
+                      )}
+                    </button>
+                    
+                    <button
+                      onClick={closePc}
+                      className="px-5 py-2 bg-rose-600/90 hover:bg-rose-700 text-white rounded-xl text-xs font-bold flex items-center space-x-2 transition-all shadow-md shadow-rose-950/20 transform active:scale-95"
+                    >
+                      <XCircle className="h-3.5 w-3.5" />
+                      <span>Disconnect</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+            {transferStatus && (
+              <div className={`mt-4 p-3 ${theme.secondary} rounded-lg`}>
+                <p className={`${theme.text} text-sm`}>{transferStatus}</p>
+              </div>
+            )}
+          </div>
+
+          {/* Right Column: Room Info, QR, Share Link */}
+          <div className="space-y-6">
+            <div className={`${theme.card} border rounded-xl p-6 shadow-md`}>
+              <h3 className={`text-xl font-bold ${theme.text} mb-4`}>Room Information</h3>
+              {currentRoom && (
+                <div className="space-y-3">
+                  <div>
+                    <p className={`${theme.textSecondary} text-sm`}>Room Name</p>
+                    <p className={`${theme.text} font-semibold`}>{currentRoom.name}</p>
+                  </div>
+                  <div>
+                    <p className={`${theme.textSecondary} text-sm`}>Room ID</p>
+                    <p className={`${theme.text} font-mono text-sm break-all`}>{currentRoom.id}</p>
+                  </div>
+                  {currentRoom.expiresAt && (
+                    <div>
+                      <p className={`${theme.textSecondary} text-sm`}>Expires At</p>
+                      <p className="text-amber-500 font-semibold text-sm">
+                        {new Date(currentRoom.expiresAt).toLocaleTimeString()}
+                      </p>
+                    </div>
+                  )}
+                  {currentRoom.oneTimeDownload && (
+                    <div className="bg-blue-500/10 text-blue-400 text-xs px-2.5 py-1.5 rounded-lg font-medium inline-block">
+                      One-Time Download Active
+                    </div>
+                  )}
+                  <div className="flex items-center space-x-2 pt-2 border-t border-gray-700/50">
+                    <Users className="h-4 w-4 text-gray-500" />
+                    <span className={`${theme.textSecondary} text-sm`}>{roomUsers.length} connected</span>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {fileShared && qrCodeUrl && (
+              <div className={`${theme.card} border rounded-xl p-6 text-center shadow-md`}>
+                <h3 className={`text-xl font-bold ${theme.text} mb-4`}>QR Code</h3>
+                <div className="bg-white p-4 rounded-lg inline-block">
+                  <img src={qrCodeUrl} alt="QR Code" className="w-32 h-32" />
+                </div>
+                <p className={`${theme.textSecondary} text-sm mt-2`}>Scan to join this secure room</p>
+              </div>
+            )}
+
+            {fileShared && shareUrl && (
+              <div className={`${theme.card} border rounded-xl p-6 shadow-md`}>
+                <h3 className={`text-xl font-bold ${theme.text} mb-4`}>Share Link</h3>
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="text"
+                    value={shareUrl}
+                    readOnly
+                    className={`flex-1 px-3 py-2 rounded-lg border ${theme.card} ${theme.text} text-sm`}
+                  />
+                  <button
+                    onClick={copyShareUrl}
+                    className={`${theme.primary} ${theme.text} px-4 py-2 rounded-lg ${theme.hover}`}
+                  >
+                    <Link className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
