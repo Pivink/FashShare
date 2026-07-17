@@ -12,6 +12,10 @@ export const useSocket = () => {
 };
 
 export const SocketProvider = ({ children }) => {
+  const [serverUrl, setServerUrl] = useState(() => {
+    const serverHost = window.location.hostname || 'localhost';
+    return `http://${serverHost}:3001`;
+  });
   const [socket, setSocket] = useState(null);
   const [connected, setConnected] = useState(false);
   const [user, setUser] = useState(null);
@@ -19,12 +23,32 @@ export const SocketProvider = ({ children }) => {
   const [roomUsers, setRoomUsers] = useState([]);
   const [roomError, setRoomError] = useState(null);
 
+  const pendingRoomIdRef = React.useRef(null);
+  const userRef = React.useRef(null);
+
   useEffect(() => {
-    const newSocket = io('http://localhost:3001');
+    userRef.current = user;
+  }, [user]);
+
+  useEffect(() => {
+    console.log('Connecting to signaling server:', serverUrl);
+    const newSocket = io(serverUrl);
 
     newSocket.on('connect', () => {
       setConnected(true);
-      console.log('Connected to server');
+      console.log('Connected to server:', serverUrl);
+      
+      // Auto-re-register user on the new signaling connection if already joined
+      if (userRef.current && userRef.current.name) {
+        console.log('Auto-registering user on new server:', userRef.current.name);
+        newSocket.emit('user:join', { name: userRef.current.name, uuid: getPersistentUuid() });
+      }
+      
+      if (pendingRoomIdRef.current) {
+        console.log('Automatically joining pending local room:', pendingRoomIdRef.current);
+        newSocket.emit('room:join', pendingRoomIdRef.current);
+        pendingRoomIdRef.current = null;
+      }
     });
 
     newSocket.on('disconnect', () => {
@@ -40,7 +64,10 @@ export const SocketProvider = ({ children }) => {
     newSocket.on('user:joined', (data) => {
       // If data contains roomId, it's another user joining the room
       if (data && data.user && data.roomId) {
-        setRoomUsers(prev => [...prev, data.user]);
+        setRoomUsers(prev => {
+          if (prev.some(u => u.id === data.user.id)) return prev;
+          return [...prev, data.user];
+        });
       } else {
         // It's the current user's own data
         setUser(data);
@@ -88,12 +115,21 @@ export const SocketProvider = ({ children }) => {
     return () => {
       newSocket.close();
     };
-  }, []);
+  }, [serverUrl]);
+
+  const getPersistentUuid = () => {
+    let id = localStorage.getItem('zepshare_user_uuid');
+    if (!id) {
+      id = 'usr_' + Math.random().toString(36).substring(2, 15);
+      localStorage.setItem('zepshare_user_uuid', id);
+    }
+    return id;
+  };
 
   const joinAsUser = (name) => {
     if (socket && connected) {
       console.log('Joining as user:', name);
-      socket.emit('user:join', { name });
+      socket.emit('user:join', { name, uuid: getPersistentUuid() });
     }
   };
 
@@ -116,6 +152,12 @@ export const SocketProvider = ({ children }) => {
     }
   };
 
+  const joinLocalRoom = (roomId, ip, port = 3001) => {
+    console.log(`Setting up local join: room=${roomId} at ${ip}:${port}`);
+    pendingRoomIdRef.current = roomId;
+    setServerUrl(`http://${ip}:${port}`);
+  };
+
   const value = {
     socket,
     connected,
@@ -125,7 +167,10 @@ export const SocketProvider = ({ children }) => {
     roomError,
     joinAsUser,
     createRoom,
-    joinRoom
+    joinRoom,
+    joinLocalRoom,
+    serverUrl,
+    setServerUrl
   };
 
   return (

@@ -1,12 +1,13 @@
 const activeTransfers = new Map();
 
-export const createTransfer = (fileId, fileName, fileSize, senderId, roomId) => {
+export const createTransfer = (fileId, fileName, fileSize, senderId, roomId, oneTimeDownload = false) => {
   const transfer = {
     id: fileId,
     fileName,
     fileSize,
     senderId,
     roomId,
+    oneTimeDownload,
     timestamp: Date.now(),
     status: 'offered',
     receivers: new Set()
@@ -30,8 +31,8 @@ export const removeReceiverFromTransfer = (fileId, receiverId) => {
   if (transfer) {
     transfer.receivers.delete(receiverId);
     
-    // Cleanup if no more receivers
-    if (transfer.receivers.size === 0) {
+    // Cleanup ONLY if it's a one-time download
+    if (transfer.oneTimeDownload && transfer.receivers.size === 0) {
       activeTransfers.delete(fileId);
     }
   }

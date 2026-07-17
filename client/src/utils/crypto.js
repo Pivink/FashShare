@@ -1,14 +1,28 @@
 // Web Crypto API helpers for encryption, hashing, and native compression
 
 // Calculate SHA-256 hash of an ArrayBuffer
-export const calculateHash = async (arrayBuffer) => {
+export const calculateHash = async (arrayBuffer, forceFallback = false) => {
+  if (!crypto.subtle || forceFallback) {
+    console.warn('Using fallback hash algorithm.');
+    const view = new Uint8Array(arrayBuffer);
+    let hash = 2166136261;
+    for (let i = 0; i < view.length; i++) {
+      hash ^= view[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0');
+  }
   const hashBuffer = await crypto.subtle.digest('SHA-256', arrayBuffer);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 };
 
 // Derive key from password using PBKDF2
-export const deriveKeyFromPassword = async (password, salt) => {
+export const deriveKeyFromPassword = async (password, salt, forceFallback = false) => {
+  if (!crypto.subtle || forceFallback) {
+    console.warn('Using fallback key derivation.');
+    return { isFallback: true, password };
+  }
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
@@ -32,7 +46,17 @@ export const deriveKeyFromPassword = async (password, salt) => {
 };
 
 // Encrypt ArrayBuffer using AES-GCM
-export const encryptBuffer = async (arrayBuffer, key, iv) => {
+export const encryptBuffer = async (arrayBuffer, key, iv, forceFallback = false) => {
+  if (!crypto.subtle || key?.isFallback || forceFallback) {
+    console.warn('Using fallback encryption cipher.');
+    const view = new Uint8Array(arrayBuffer);
+    const encrypted = new Uint8Array(view.length);
+    const keyStr = key?.password || 'fallback';
+    for (let i = 0; i < view.length; i++) {
+      encrypted[i] = view[i] ^ keyStr.charCodeAt(i % keyStr.length);
+    }
+    return encrypted.buffer;
+  }
   return crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
     key,
@@ -41,7 +65,17 @@ export const encryptBuffer = async (arrayBuffer, key, iv) => {
 };
 
 // Decrypt ArrayBuffer using AES-GCM
-export const decryptBuffer = async (arrayBuffer, key, iv) => {
+export const decryptBuffer = async (arrayBuffer, key, iv, forceFallback = false) => {
+  if (!crypto.subtle || key?.isFallback || forceFallback) {
+    console.warn('Using fallback decryption cipher.');
+    const view = new Uint8Array(arrayBuffer);
+    const decrypted = new Uint8Array(view.length);
+    const keyStr = key?.password || 'fallback';
+    for (let i = 0; i < view.length; i++) {
+      decrypted[i] = view[i] ^ keyStr.charCodeAt(i % keyStr.length);
+    }
+    return decrypted.buffer;
+  }
   return crypto.subtle.decrypt(
     { name: 'AES-GCM', iv },
     key,

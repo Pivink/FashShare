@@ -5,6 +5,7 @@ import cors from 'cors';
 import config from './config.js';
 import socketRoutes from './routes/socket.js';
 import { startRoomCleanup } from './utils/cleanup.js';
+import { startListening } from './utils/localDiscovery.js';
 
 const app = express();
 const server = createServer(app);
@@ -24,6 +25,9 @@ app.use(express.json());
 
 // Initialize socket routes
 socketRoutes(io);
+
+// Start local UDP discovery listening
+startListening(io);
 
 // Start room cleanup background task
 startRoomCleanup();

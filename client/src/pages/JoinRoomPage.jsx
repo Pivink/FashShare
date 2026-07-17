@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'react-router-dom';
-import { Upload, Link, Users, Send, X, Download, Check, XCircle, Shield, Key, Sparkles, Clock } from 'lucide-react';
+import { Upload, Link, Users, Send, X, Download, Check, XCircle, Shield, Key, Sparkles, Clock, Globe, Wifi } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useTheme } from '../contexts/ThemeContext';
 import { useSocket } from '../contexts/SocketContext';
@@ -81,6 +81,7 @@ const JoinRoomPage = () => {
   const [receiverPassword, setReceiverPassword] = useState('');
   const [showPasswordPrompt, setShowPasswordPrompt] = useState(false);
   const [selectedFileToDownload, setSelectedFileToDownload] = useState(null);
+  const [passwordError, setPasswordError] = useState('');
 
   const fileInputRef = useRef(null);
   const pcRef = useRef(null);           // RTCPeerConnection
@@ -106,6 +107,18 @@ const JoinRoomPage = () => {
 
   // Keep socketRef current
   useEffect(() => { socketRef.current = socket; }, [socket]);
+
+  // Keep refs for event listener closures updated
+  const currentRoomRef = useRef(currentRoom);
+  const receiverPasswordRef = useRef(receiverPassword);
+
+  useEffect(() => {
+    currentRoomRef.current = currentRoom;
+  }, [currentRoom]);
+
+  useEffect(() => {
+    receiverPasswordRef.current = receiverPassword;
+  }, [receiverPassword]);
 
   // Helper: close any existing peer connection
   const closePc = () => {
@@ -166,12 +179,14 @@ const JoinRoomPage = () => {
           size: data.fileSize,
           senderId: data.senderId,
           senderName: data.senderName,
-          // Encrypted transfer metadata
           isPasswordProtected: data.isPasswordProtected,
           isCompressed: data.isCompressed,
           fileHash: data.fileHash,
           salt: data.salt,
-          iv: data.iv
+          iv: data.iv,
+          encryptionType: data.encryptionType,
+          authToken: data.authToken,
+          authIv: data.authIv
         }];
       });
       setTransferStatus(`New file available: ${data.fileName} from ${data.senderName}`);
@@ -190,7 +205,10 @@ const JoinRoomPage = () => {
           isCompressed: o.isCompressed,
           fileHash: o.fileHash,
           salt: o.salt,
-          iv: o.iv
+          iv: o.iv,
+          encryptionType: o.encryptionType,
+          authToken: o.authToken,
+          authIv: o.authIv
         })));
       }
     };
@@ -219,9 +237,9 @@ const JoinRoomPage = () => {
 
       closePc();
       
-      if (!receivedChunksRef.current || receivedChunksRef.current.length === 0) {
-        receivedChunksRef.current = [];
-      }
+      // Restore the active file ref and clear the chunks buffer for the new connection
+      receivingFileRef.current = receivingFile;
+      receivedChunksRef.current = [];
 
       const pc = new RTCPeerConnection(ICE_SERVERS);
       pcRef.current = pc;
@@ -360,6 +378,7 @@ const JoinRoomPage = () => {
         };
 
         dc.onerror = (err) => {
+          if (dcRef.current !== dc) return;
           const errorMsg = err?.error?.message || err?.message || '';
           if (errorMsg.includes('Close called') || errorMsg.includes('User-Initiated Abort')) {
             console.log('Data channel closed cleanly by user cancellation.');
@@ -371,6 +390,7 @@ const JoinRoomPage = () => {
         };
 
         dc.onclose = () => {
+          if (dcRef.current !== dc) return;
           console.log('Data channel closed');
           setTransferStatus('Connection closed');
           closePc();
@@ -437,15 +457,25 @@ const JoinRoomPage = () => {
     };
   }, [socket]);
 
-  // Reset share state when room changes – but preserve offeredFiles
+  // Reset state and generate URLs when room changes
   useEffect(() => {
     if (currentRoom) {
-      setShareUrl('');
-      setQrCodeUrl('');
-      setFileShared(false);
       closePc();
       receivingFileRef.current = null;
       receivedChunksRef.current = [];
+
+      // Generate join URL and QR Code immediately using host IP for local rooms
+      const origin = currentRoom.isLocal && currentRoom.hostIp
+        ? `http://${currentRoom.hostIp}:5173`
+        : window.location.origin;
+      const url = `${origin}/join/${currentRoom.id}`;
+      setShareUrl(url);
+      generateQRCode(url);
+      setFileShared(true);
+    } else {
+      setShareUrl('');
+      setQrCodeUrl('');
+      setFileShared(false);
     }
   }, [currentRoom]);
 
@@ -499,17 +529,18 @@ const JoinRoomPage = () => {
       setTransferStatus('Decrypting secure file end-to-end...');
       const iv = hexToBuf(file.iv);
       let key;
+      const forceFallback = !crypto.subtle || file.encryptionType === 'fallback' || currentRoomRef.current?.isLocal;
       
       if (file.isPasswordProtected) {
         const salt = hexToBuf(file.salt);
-        key = await deriveKeyFromPassword(receiverPassword, salt);
+        key = await deriveKeyFromPassword(receiverPasswordRef.current, salt, forceFallback);
       } else {
         const dummySalt = new Uint8Array(16);
-        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt);
+        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt, forceFallback);
       }
       
       try {
-        finalBuffer = await decryptBuffer(finalBuffer, key, iv);
+        finalBuffer = await decryptBuffer(finalBuffer, key, iv, forceFallback);
       } catch (err) {
         console.error('Decryption failed:', err);
         setTransferStatus('Error: Incorrect password or corrupted data. Decryption failed.');
@@ -529,7 +560,7 @@ const JoinRoomPage = () => {
       }
       
       setTransferStatus('Verifying file integrity...');
-      const receivedHash = await calculateHash(finalBuffer);
+      const receivedHash = await calculateHash(finalBuffer, forceFallback);
       if (receivedHash !== file.fileHash) {
         console.error('Hash mismatch! File integrity compromised.');
         setTransferStatus('Error: Integrity check failed (SHA-256 mismatch).');
@@ -537,30 +568,55 @@ const JoinRoomPage = () => {
       }
       
       setTransferStatus('Saving file...');
+
+      // Chrome blocks blob: URL downloads over insecure HTTP (local mode).
+      // Use a base64 data URI in that case – it is never blocked.
+      const isSecureContext = window.isSecureContext;
       const blob = new Blob([finalBuffer]);
-      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
       a.download = file.name || 'downloaded_file';
+      a.style.display = 'none';
       document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      
+
+      if (isSecureContext) {
+        // HTTPS / localhost – use fast blob URL
+        const blobUrl = URL.createObjectURL(blob);
+        a.href = blobUrl;
+        a.click();
+        setTimeout(() => {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(blobUrl);
+        }, 1000);
+      } else {
+        // Local HTTP (e.g. http://172.16.x.x) – convert to data URI
+        const reader = new FileReader();
+        reader.onload = () => {
+          a.href = reader.result;
+          a.click();
+          setTimeout(() => {
+            try { document.body.removeChild(a); } catch(e) {}
+          }, 1000);
+        };
+        reader.readAsDataURL(blob);
+      }
+
       setTransferProgress(100);
-      setTransferStatus('Transfer and verification completed successfully!');
+      setTransferStatus(`✅ Downloaded: ${file.name}`);
+      setIsTransferring(false); // Hide progress bar immediately
       socketRef.current?.emit('transfer:complete', { fileId: file.id });
-      
+      console.log('Receiver successfully assembled and downloaded the file.');
+
+      // Clean up chunk state immediately after download triggered
+      receivedChunksRef.current = [];
+      receivingFileRef.current = null;
+
       setTimeout(() => {
         setTransferProgress(0);
         setTransferStatus('');
-        setActivePeer(null);
-      }, 3000);
-      
-      receivedChunksRef.current = [];
-      receivingFileRef.current = null;
-      closePc();
-      
+        // Close peer connection after brief delay (let transfer_complete signal through)
+        closePc();
+      }, 2000);
+
     } catch (error) {
       console.error('Assemble file error:', error);
       setTransferStatus('Error during file assembly: ' + error.message);
@@ -662,7 +718,10 @@ const JoinRoomPage = () => {
       
       setTransferProgress(100);
       setTransferStatus(`File ready for sharing: ${selectedFile.name}`);
-      const url = `${window.location.origin}/join/${currentRoom.id}`;
+      const origin = currentRoom.isLocal && currentRoom.hostIp
+        ? `http://${currentRoom.hostIp}:5173`
+        : window.location.origin;
+      const url = `${origin}/join/${currentRoom.id}`;
       setShareUrl(url);
       generateQRCode(url);
       setFileShared(true);
@@ -690,19 +749,56 @@ const JoinRoomPage = () => {
   };
 
   const startDownloadRequest = (file) => {
+    receivedChunksRef.current = [];
     receivingFileRef.current = file;
     socket.emit('file:request', { fileId: file.id, candidateId: socket.id });
     setTransferStatus(`Requesting connection to sender for ${file.name}...`);
   };
 
-  const handlePasswordSubmit = (e) => {
+  const handlePasswordSubmit = async (e) => {
     e.preventDefault();
     if (!receiverPassword.trim()) return;
-    
-    setShowPasswordPrompt(false);
-    if (selectedFileToDownload) {
-      startDownloadRequest(selectedFileToDownload);
+
+    const file = selectedFileToDownload;
+    if (!file) return;
+
+    setPasswordError('');
+
+    // --- Pre-verify password BEFORE sending the download request ---
+    if (file.authToken && file.authIv && file.salt) {
+      try {
+        const forceFallback = !crypto.subtle || file.encryptionType === 'fallback' || currentRoomRef.current?.isLocal;
+        const salt = hexToBuf(file.salt);
+        const testKey = await deriveKeyFromPassword(receiverPassword, salt, forceFallback);
+        const authIvBuf = hexToBuf(file.authIv);
+        const encryptedTokenBuf = hexToBuf(file.authToken);
+
+        let decrypted;
+        try {
+          decrypted = await decryptBuffer(encryptedTokenBuf, testKey, authIvBuf, forceFallback);
+        } catch {
+          setPasswordError('❌ Incorrect password. Please try again.');
+          setReceiverPassword('');
+          return;
+        }
+
+        const decoded = new TextDecoder().decode(decrypted);
+        if (decoded !== 'fashshare-auth-verification-token') {
+          setPasswordError('❌ Incorrect password. Please try again.');
+          setReceiverPassword('');
+          return;
+        }
+      } catch (err) {
+        console.error('Password pre-verification error:', err);
+        setPasswordError('❌ Incorrect password. Please try again.');
+        setReceiverPassword('');
+        return;
+      }
     }
+
+    setPasswordError('');
+    setShowPasswordPrompt(false);
+    startDownloadRequest(file);
   };
 
   // Sender: accept a download request
@@ -763,6 +859,10 @@ const JoinRoomPage = () => {
           setTransferStatus('File transferred successfully!');
           setTransferProgress(100);
           closePc();
+          setTimeout(() => {
+            setTransferStatus('');
+            setTransferProgress(0);
+          }, 2000);
         }
       } catch (err) {
         console.error('Error parsing client ready state:', err);
@@ -770,11 +870,18 @@ const JoinRoomPage = () => {
     };
 
     dc.onerror = (err) => {
+      if (dcRef.current !== dc) return;
       console.error('Data channel error:', err);
       setTransferStatus('Transfer error');
+      closePc();
     };
 
-    dc.onclose = () => console.log('Data channel closed');
+    dc.onclose = () => {
+      if (dcRef.current !== dc) return;
+      console.log('Data channel closed');
+      setTransferStatus('Connection closed');
+      closePc();
+    };
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -1007,12 +1114,18 @@ const JoinRoomPage = () => {
               <input
                 type="password"
                 value={receiverPassword}
-                onChange={(e) => setReceiverPassword(e.target.value)}
-                className={`w-full px-4 py-3 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                onChange={(e) => { setReceiverPassword(e.target.value); setPasswordError(''); }}
+                className={`w-full px-4 py-3 rounded-lg border ${passwordError ? 'border-red-500 ring-2 ring-red-500/40' : ''} ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
                 placeholder="Enter password"
                 required
                 autoFocus
               />
+              {passwordError && (
+                <p className="text-red-400 text-sm font-medium flex items-center gap-1.5">
+                  <Shield className="h-4 w-4 flex-shrink-0" />
+                  {passwordError.replace('❌ ', '')}
+                </p>
+              )}
               <button
                 type="submit"
                 className={`w-full ${theme.primary} ${theme.text} py-3 rounded-lg font-semibold ${theme.hover}`}
@@ -1030,9 +1143,28 @@ const JoinRoomPage = () => {
           <div className="lg:col-span-2 space-y-6">
             {/* Sender Section */}
             <div className={`${theme.card} border rounded-xl p-8 shadow-md`}>
-              <h2 className={`text-2xl font-bold ${theme.text} mb-6 flex items-center gap-2`}>
-                <Sparkles className="text-blue-500 h-6 w-6" /> Share Secure Files
-              </h2>
+              <div className="flex justify-between items-center mb-6 flex-wrap gap-3">
+                <h2 className={`text-2xl font-bold ${theme.text} flex items-center gap-2`}>
+                  <Sparkles className="text-blue-500 h-6 w-6" /> Share Secure Files
+                </h2>
+                {currentRoom && (
+                  <span className={`text-xs font-bold px-3 py-1 rounded-full flex items-center gap-1.5 shadow-sm border ${
+                    currentRoom.isLocal 
+                      ? 'bg-purple-500/10 text-purple-400 border-purple-500/30 shadow-purple-950/20' 
+                      : 'bg-blue-500/10 text-blue-400 border-blue-500/30 shadow-blue-950/20'
+                  }`}>
+                    {currentRoom.isLocal ? (
+                      <>
+                        <Wifi className="h-3.5 w-3.5 animate-pulse" /> Local LAN Mode
+                      </>
+                    ) : (
+                      <>
+                        <Globe className="h-3.5 w-3.5" /> Internet Mode
+                      </>
+                    )}
+                  </span>
+                )}
+              </div>
               <div
                 className={`border-2 border-dashed rounded-lg p-8 text-center transition-all duration-300 ${
                   dragActive ? `border-blue-500 bg-blue-50 ${theme.primary}` : `border-gray-300 ${theme.hover}`
@@ -1146,7 +1278,9 @@ const JoinRoomPage = () => {
                     <div key={idx} className={`p-4 ${theme.secondary} rounded-lg flex items-center justify-between`}>
                       <div>
                         <p className={`${theme.text} font-semibold`}>{req.requesterName} wants to download a file</p>
-                        <p className={`${theme.textSecondary} text-sm`}>File ID: {req.fileId}</p>
+                        <p className={`${theme.textSecondary} text-sm`}>
+                          {myOfferedFiles.find(f => f.id === req.fileId)?.name || req.fileId}
+                        </p>
                       </div>
                       <div className="flex space-x-2">
                         <button
@@ -1168,9 +1302,8 @@ const JoinRoomPage = () => {
               </div>
             )}
 
-            {/* Progress & Status */}
-            {/* Progress & Status */}
-            {(isTransferring || transferProgress > 0) && (
+            {/* Progress & Status — only visible while a transfer is actually in progress */}
+            {isTransferring && (
               <div className="mt-6 p-6 rounded-2xl bg-gradient-to-br from-indigo-950/80 via-slate-900/90 to-purple-950/80 border border-indigo-500/30 backdrop-blur-xl shadow-2xl relative overflow-hidden">
                 {/* Glow decorations */}
                 <div className="absolute -top-12 -left-12 w-24 h-24 bg-indigo-500/20 rounded-full blur-2xl" />
@@ -1269,6 +1402,12 @@ const JoinRoomPage = () => {
                   <div>
                     <p className={`${theme.textSecondary} text-sm`}>Room ID</p>
                     <p className={`${theme.text} font-mono text-sm break-all`}>{currentRoom.id}</p>
+                  </div>
+                  <div>
+                    <p className={`${theme.textSecondary} text-sm`}>Sharing Mode</p>
+                    <p className={`font-semibold text-sm ${currentRoom.isLocal ? 'text-purple-400' : 'text-blue-400'}`}>
+                      {currentRoom.isLocal ? '🏠 Local Network (LAN)' : '🌐 Internet (Global)'}
+                    </p>
                   </div>
                   {currentRoom.expiresAt && (
                     <div>

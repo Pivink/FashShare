@@ -1,3 +1,5 @@
+import { stopAdvertising, getLocalIp } from '../utils/localDiscovery.js';
+
 const rooms = new Map();
 
 export const createRoom = (id, name, creatorId, options = {}) => {
@@ -5,12 +7,14 @@ export const createRoom = (id, name, creatorId, options = {}) => {
     id,
     name,
     creator: creatorId,
+    creatorName: options.creatorName || 'Local Host',
     users: new Set([creatorId]),
     offers: [], // Store file offers inside the room object
     createdAt: Date.now(),
     lastActive: Date.now(),
     expiresAt: options.expiresAfter ? Date.now() + options.expiresAfter * 60 * 1000 : null,
-    oneTimeDownload: options.oneTimeDownload || false
+    oneTimeDownload: options.oneTimeDownload || false,
+    isLocal: options.isLocal || false
   };
   rooms.set(id, room);
   return room;
@@ -31,10 +35,13 @@ export const getRoomSummary = (room) => ({
   id: room.id,
   name: room.name,
   creator: room.creator,
+  creatorName: room.creatorName,
   userCount: room.users.size,
   createdAt: room.createdAt,
   expiresAt: room.expiresAt,
-  oneTimeDownload: room.oneTimeDownload
+  oneTimeDownload: room.oneTimeDownload,
+  isLocal: room.isLocal,
+  hostIp: room.isLocal ? getLocalIp() : null
 });
 
 export const addUserToRoom = (roomId, userId) => {
@@ -71,7 +78,13 @@ export const removeOfferFromRoom = (roomId, fileId) => {
   }
 };
 
+
+
 export const deleteRoom = (roomId) => {
+  const room = rooms.get(roomId);
+  if (room && room.isLocal) {
+    stopAdvertising(roomId);
+  }
   rooms.delete(roomId);
 };
 
@@ -87,6 +100,9 @@ export const cleanupInactiveRooms = () => {
     const isEmptyAndInactive = room.users.size === 0 && (now - room.lastActive) > 3600000;
     
     if (isExpired || isEmptyAndInactive) {
+      if (room.isLocal) {
+        stopAdvertising(id);
+      }
       rooms.delete(id);
       count++;
     }

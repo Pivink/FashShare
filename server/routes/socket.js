@@ -2,7 +2,7 @@ import * as roomController from '../controllers/room.js';
 import * as transferController from '../controllers/transfer.js';
 import * as signalingController from '../controllers/signaling.js';
 import { startHeartbeat } from '../utils/heartbeat.js';
-import { createUser, deleteUser, getUser } from '../stores/users.js';
+import { createUser, deleteUser, getUser, getAllUsers } from '../stores/users.js';
 import { getRoom, deleteRoom } from '../stores/rooms.js';
 
 export default (io) => {
@@ -14,7 +14,22 @@ export default (io) => {
     
     // User management
     socket.on('user:join', (userData) => {
-      const user = createUser(socket.id, userData.name);
+      if (userData.uuid) {
+        const existing = getAllUsers().find(u => u.uuid === userData.uuid);
+        if (existing) {
+          console.log(`Cleaning up stale duplicate user session: id=${existing.id}, name=${existing.name}`);
+          // Make the stale user leave all active rooms they were in
+          existing.rooms.forEach(roomId => {
+            const leaveResult = roomController.handleLeaveRoom(
+              io.sockets.sockets.get(existing.id) || { id: existing.id, leave: () => {} },
+              roomId
+            );
+            io.to(roomId).emit('user:left', leaveResult);
+          });
+          deleteUser(existing.id);
+        }
+      }
+      const user = createUser(socket.id, userData.name, userData.uuid);
       socket.emit('user:joined', user);
     });
     

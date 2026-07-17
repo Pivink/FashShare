@@ -15,7 +15,8 @@ export const handleFileOffer = (socket, data) => {
     fileName,
     fileSize,
     socket.id,
-    roomId
+    roomId,
+    data.oneTimeDownload || false
   );
   
   // Store the offer metadata in the room
@@ -34,7 +35,10 @@ export const handleFileOffer = (socket, data) => {
     salt: data.salt || null,
     iv: data.iv || null,
     expiresAt: data.expiresAt || null,
-    oneTimeDownload: data.oneTimeDownload || false
+    oneTimeDownload: data.oneTimeDownload || false,
+    encryptionType: data.encryptionType || null,
+    authToken: data.authToken || null,
+    authIv: data.authIv || null
   };
   
   addOfferToRoom(roomId, offer);

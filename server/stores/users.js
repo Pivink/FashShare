@@ -1,10 +1,11 @@
 const users = new Map();
 const connectionQuality = new Map();
 
-export const createUser = (socketId, name) => {
+export const createUser = (socketId, name, uuid = null) => {
   const user = {
     id: socketId,
     name,
+    uuid,
     joinedAt: Date.now(),
     lastSeen: Date.now(),
     rooms: new Set()
@@ -14,6 +15,7 @@ export const createUser = (socketId, name) => {
 };
 
 export const getUser = (id) => users.get(id);
+export const getAllUsers = () => Array.from(users.values());
 
 export const updateLastSeen = (userId) => {
   const user = users.get(userId);

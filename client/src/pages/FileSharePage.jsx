@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Upload, Link, Users, Send, X, Download, Check, XCircle, Shield, Key, Clock, Sparkles } from 'lucide-react';
+import { Upload, Link, Users, Send, X, Download, Check, XCircle, Shield, Key, Clock, Sparkles, Globe, Wifi, Plus, Search } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useTheme } from '../contexts/ThemeContext';
 import { useSocket } from '../contexts/SocketContext';
@@ -44,6 +44,8 @@ const FileSharePage = () => {
     user,
     joinAsUser,
     createRoom,
+    joinRoom,
+    joinLocalRoom,
     currentRoom,
     roomUsers
   } = useSocket();
@@ -62,6 +64,11 @@ const FileSharePage = () => {
   const [myOfferedFiles, setMyOfferedFiles] = useState([]);
   const [pendingRequests, setPendingRequests] = useState([]);
 
+  // Local Mode & Discovery states
+  const [sharingMode, setSharingMode] = useState('internet'); // 'internet' or 'local'
+  const [discoveredRooms, setDiscoveredRooms] = useState([]);
+  const [joinRoomId, setJoinRoomId] = useState('');
+
   // Room enhancements state
   const [expiresAfter, setExpiresAfter] = useState('0'); // '0' = Never, '5' = 5 min, '10' = 10 min, '60' = 1 Hour
   const [oneTimeDownload, setOneTimeDownload] = useState(false);
@@ -72,6 +79,7 @@ const FileSharePage = () => {
   const [receiverPassword, setReceiverPassword] = useState('');
   const [showPasswordPrompt, setShowPasswordPrompt] = useState(false);
   const [selectedFileToDownload, setSelectedFileToDownload] = useState(null);
+  const [passwordError, setPasswordError] = useState('');
 
   const fileInputRef = useRef(null);
   const pcRef = useRef(null);           // RTCPeerConnection
@@ -97,6 +105,18 @@ const FileSharePage = () => {
 
   // Keep socketRef current
   useEffect(() => { socketRef.current = socket; }, [socket]);
+
+  // Keep refs for event listener closures updated
+  const currentRoomRef = useRef(currentRoom);
+  const receiverPasswordRef = useRef(receiverPassword);
+
+  useEffect(() => {
+    currentRoomRef.current = currentRoom;
+  }, [currentRoom]);
+
+  useEffect(() => {
+    receiverPasswordRef.current = receiverPassword;
+  }, [receiverPassword]);
 
   // Helper: close any existing peer connection
   const closePc = () => {
@@ -157,12 +177,14 @@ const FileSharePage = () => {
           size: data.fileSize,
           senderId: data.senderId,
           senderName: data.senderName,
-          // Encrypted transfer metadata
           isPasswordProtected: data.isPasswordProtected,
           isCompressed: data.isCompressed,
           fileHash: data.fileHash,
           salt: data.salt,
-          iv: data.iv
+          iv: data.iv,
+          encryptionType: data.encryptionType,
+          authToken: data.authToken,
+          authIv: data.authIv
         }];
       });
       setTransferStatus(`New file available: ${data.fileName} from ${data.senderName}`);
@@ -192,11 +214,9 @@ const FileSharePage = () => {
 
       closePc();
       
-      // If we are resuming, we preserve receivedChunksRef.current. Otherwise, reset.
-      // (For this version, we will dynamically check if the array is already filled)
-      if (!receivedChunksRef.current || receivedChunksRef.current.length === 0) {
-        receivedChunksRef.current = [];
-      }
+      // Restore the active file ref and clear the chunks buffer for the new connection
+      receivingFileRef.current = receivingFile;
+      receivedChunksRef.current = [];
 
       const pc = new RTCPeerConnection(ICE_SERVERS);
       pcRef.current = pc;
@@ -296,7 +316,19 @@ const FileSharePage = () => {
           setTransferStatus('Connected – exchanging metadata…');
         };
 
-        dc.onerror = (err) => console.error('Data channel error:', err);
+        dc.onerror = (err) => {
+          if (dcRef.current !== dc) return;
+          console.error('Data channel error:', err);
+          setTransferStatus('Transfer error');
+          closePc();
+        };
+
+        dc.onclose = () => {
+          if (dcRef.current !== dc) return;
+          console.log('Data channel closed');
+          setTransferStatus('Connection closed');
+          closePc();
+        };
       };
 
       await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
@@ -340,12 +372,20 @@ const FileSharePage = () => {
       setTransferStatus(`Transfer progress: ${data.progress}%`);
     };
 
+    const onLocalRoomDiscovered = (roomData) => {
+      setDiscoveredRooms(prev => {
+        const filtered = prev.filter(r => r.roomId !== roomData.roomId);
+        return [...filtered, roomData];
+      });
+    };
+
     socket.on('file:offered', onFileOffered);
     socket.on('file:requested', onFileRequested);
     socket.on('transfer:progress', onTransferProgress);
     socket.on('rtc:offer', onRtcOffer);
     socket.on('rtc:answer', onRtcAnswer);
     socket.on('rtc:ice-candidate', onRtcIceCandidate);
+    socket.on('local:room:discovered', onLocalRoomDiscovered);
 
     return () => {
       socket.off('file:offered', onFileOffered);
@@ -354,21 +394,41 @@ const FileSharePage = () => {
       socket.off('rtc:offer', onRtcOffer);
       socket.off('rtc:answer', onRtcAnswer);
       socket.off('rtc:ice-candidate', onRtcIceCandidate);
+      socket.off('local:room:discovered', onLocalRoomDiscovered);
     };
   }, [socket]);
 
-  // Reset state when room changes
+  // Local rooms discovery pruning interval
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setDiscoveredRooms(prev => prev.filter(r => now - r.lastSeen < 7000));
+    }, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Reset state and generate URLs when room changes
   useEffect(() => {
     if (currentRoom) {
-      setShareUrl('');
-      setQrCodeUrl('');
-      setFileShared(false);
       setOfferedFiles([]);
       setMyOfferedFiles([]);
       setPendingRequests([]);
       closePc();
       receivingFileRef.current = null;
       receivedChunksRef.current = [];
+
+      // Generate join URL and QR Code immediately using host IP for local rooms
+      const origin = currentRoom.isLocal && currentRoom.hostIp
+        ? `http://${currentRoom.hostIp}:5173`
+        : window.location.origin;
+      const url = `${origin}/join/${currentRoom.id}`;
+      setShareUrl(url);
+      generateQRCode(url);
+      setFileShared(true);
+    } else {
+      setShareUrl('');
+      setQrCodeUrl('');
+      setFileShared(false);
     }
   }, [currentRoom]);
 
@@ -400,22 +460,22 @@ const FileSharePage = () => {
       
       let finalBuffer = combinedBuffer.buffer;
       
-      // 1. Decrypt (AES-256-GCM)
+      // 1. Decrypt
       setTransferStatus('Decrypting secure file end-to-end...');
       const iv = hexToBuf(file.iv);
       let key;
+      const forceFallback = !crypto.subtle || file.encryptionType === 'fallback' || currentRoomRef.current?.isLocal;
       
       if (file.isPasswordProtected) {
         const salt = hexToBuf(file.salt);
-        key = await deriveKeyFromPassword(receiverPassword, salt);
+        key = await deriveKeyFromPassword(receiverPasswordRef.current, salt, forceFallback);
       } else {
-        // Fallback or default session key
         const dummySalt = new Uint8Array(16);
-        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt);
+        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt, forceFallback);
       }
       
       try {
-        finalBuffer = await decryptBuffer(finalBuffer, key, iv);
+        finalBuffer = await decryptBuffer(finalBuffer, key, iv, forceFallback);
       } catch (err) {
         console.error('Decryption failed:', err);
         setTransferStatus('Error: Incorrect password or corrupted data. Decryption failed.');
@@ -437,7 +497,7 @@ const FileSharePage = () => {
       
       // 3. Verify SHA-256 Hash
       setTransferStatus('Verifying file integrity...');
-      const receivedHash = await calculateHash(finalBuffer);
+      const receivedHash = await calculateHash(finalBuffer, forceFallback);
       if (receivedHash !== file.fileHash) {
         console.error('Hash mismatch! File integrity compromised.');
         setTransferStatus('Error: Integrity check failed (SHA-256 mismatch). The file may be corrupted.');
@@ -446,31 +506,54 @@ const FileSharePage = () => {
       
       // 4. Download File
       setTransferStatus('Saving file...');
+
+      // Chrome blocks blob: URL downloads over insecure HTTP (local mode).
+      // Use a base64 data URI in that case – it is never blocked.
+      const isSecureContext = window.isSecureContext;
       const blob = new Blob([finalBuffer]);
-      const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
       a.download = file.name || 'downloaded_file';
+      a.style.display = 'none';
       document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      
+
+      if (isSecureContext) {
+        const blobUrl = URL.createObjectURL(blob);
+        a.href = blobUrl;
+        a.click();
+        setTimeout(() => {
+          document.body.removeChild(a);
+          URL.revokeObjectURL(blobUrl);
+        }, 1000);
+      } else {
+        // Local HTTP (e.g. http://172.16.x.x) — convert to data URI
+        const reader = new FileReader();
+        reader.onload = () => {
+          a.href = reader.result;
+          a.click();
+          setTimeout(() => {
+            try { document.body.removeChild(a); } catch(e) {}
+          }, 1000);
+        };
+        reader.readAsDataURL(blob);
+      }
+
       setTransferProgress(100);
-      setTransferStatus('Transfer and verification completed successfully!');
+      setTransferStatus(`✅ Downloaded: ${file.name}`);
+      setIsTransferring(false); // Hide progress bar immediately
       socketRef.current?.emit('transfer:complete', { fileId: file.id });
-      
+      console.log('Receiver successfully assembled and downloaded the file.');
+
+      // Clean up chunk state immediately after download triggered
+      receivedChunksRef.current = [];
+      receivingFileRef.current = null;
+
       setTimeout(() => {
         setTransferProgress(0);
         setTransferStatus('');
-        setActivePeer(null);
-      }, 3000);
-      
-      // Cleanup
-      receivedChunksRef.current = [];
-      receivingFileRef.current = null;
-      closePc();
-      
+        // Close peer connection after brief delay (let transfer_complete signal through)
+        closePc();
+      }, 2000);
+
     } catch (error) {
       console.error('Assemble file error:', error);
       setTransferStatus('Error during file assembly: ' + error.message);
@@ -489,8 +572,16 @@ const FileSharePage = () => {
       createRoom({
         name: roomName.trim(),
         expiresAfter: expiresAfter === '0' ? null : parseInt(expiresAfter),
-        oneTimeDownload: oneTimeDownload
+        oneTimeDownload: oneTimeDownload,
+        isLocal: sharingMode === 'local'
       });
+    }
+  };
+
+  const handleManualJoin = (e) => {
+    e.preventDefault();
+    if (joinRoomId.trim()) {
+      joinRoom(joinRoomId.trim());
     }
   };
 
@@ -529,16 +620,18 @@ const FileSharePage = () => {
     try {
       const originalBuffer = await selectedFile.arrayBuffer();
       
-      // 1. Calculate SHA-256 Hash
-      const fileHash = await calculateHash(originalBuffer);
+      // 1. Determine if we must use fallback encryption (e.g. Local Mode rooms)
+      const forceFallback = !crypto.subtle || currentRoom?.isLocal;
+
+      // 2. Calculate Hash
+      const fileHash = await calculateHash(originalBuffer, forceFallback);
       
-      // 2. Compression check
+      // 3. Compression check
       let finalBuffer = originalBuffer;
       let isCompressed = false;
       
       if (shouldCompress(selectedFile.name)) {
         const compressed = await compressBuffer(originalBuffer);
-        // Adaptive check: only use compression if it yields smaller size
         if (compressed.byteLength < originalBuffer.byteLength * 0.95) {
           finalBuffer = compressed;
           isCompressed = true;
@@ -548,22 +641,29 @@ const FileSharePage = () => {
         }
       }
       
-      // 3. Encrypt Buffer (AES-256-GCM)
+      // 4. Encrypt Buffer
       let salt = null;
       let key;
       const iv = crypto.getRandomValues(new Uint8Array(12));
+      let authToken = null;
+      let authIv = null;
       
       if (isPasswordProtected && password) {
         salt = crypto.getRandomValues(new Uint8Array(16));
-        key = await deriveKeyFromPassword(password, salt);
+        key = await deriveKeyFromPassword(password, salt, forceFallback);
+        
+        // Encrypt the static validation string to create a password verifier
+        authIv = crypto.getRandomValues(new Uint8Array(12));
+        const verifierBuffer = new TextEncoder().encode('fashshare-auth-verification-token');
+        const encryptedVerifier = await encryptBuffer(verifierBuffer.buffer, key, authIv, forceFallback);
+        authToken = bufToHex(encryptedVerifier);
       } else {
-        // Use a generic session key for E2E routing if no password
         const dummySalt = new Uint8Array(16);
-        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt);
+        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt, forceFallback);
       }
       
-      const encryptedBuffer = await encryptBuffer(finalBuffer, key, iv);
-      senderBufferRef.current = encryptedBuffer; // Store prepared encrypted buffer
+      const encryptedBuffer = await encryptBuffer(finalBuffer, key, iv, forceFallback);
+      senderBufferRef.current = encryptedBuffer;
 
       const fileId = Date.now().toString();
       
@@ -581,20 +681,25 @@ const FileSharePage = () => {
         fileName: selectedFile.name,
         fileSize: selectedFile.size,
         fileId,
-        // Crypto & compression metadata
         isPasswordProtected: isPasswordProtected && !!password,
         salt: salt ? bufToHex(salt) : null,
         iv: bufToHex(iv),
         isCompressed,
         fileHash,
-        oneTimeDownload
+        oneTimeDownload,
+        encryptionType: forceFallback ? 'fallback' : 'aes-gcm',
+        authToken,
+        authIv: authIv ? bufToHex(authIv) : null
       };
       
       socket.emit('file:offer', offerPayload);
       
       setTransferProgress(100);
       setTransferStatus(`File ready for sharing: ${selectedFile.name}`);
-      const url = `${window.location.origin}/join/${currentRoom.id}`;
+      const origin = currentRoom.isLocal && currentRoom.hostIp
+        ? `http://${currentRoom.hostIp}:5173`
+        : window.location.origin;
+      const url = `${origin}/join/${currentRoom.id}`;
       setShareUrl(url);
       generateQRCode(url);
       setFileShared(true);
@@ -622,19 +727,56 @@ const FileSharePage = () => {
   };
 
   const startDownloadRequest = (file) => {
+    receivedChunksRef.current = [];
     receivingFileRef.current = file;
     socket.emit('file:request', { fileId: file.id, candidateId: socket.id });
     setTransferStatus(`Requesting connection to sender for ${file.name}...`);
   };
 
-  const handlePasswordSubmit = (e) => {
+  const handlePasswordSubmit = async (e) => {
     e.preventDefault();
     if (!receiverPassword.trim()) return;
     
-    setShowPasswordPrompt(false);
-    if (selectedFileToDownload) {
-      startDownloadRequest(selectedFileToDownload);
+    const file = selectedFileToDownload;
+    if (!file) return;
+
+    setPasswordError('');
+
+    // --- Pre-verify password BEFORE sending the download request ---
+    if (file.authToken && file.authIv && file.salt) {
+      try {
+        const forceFallback = !crypto.subtle || file.encryptionType === 'fallback' || currentRoomRef.current?.isLocal;
+        const salt = hexToBuf(file.salt);
+        const testKey = await deriveKeyFromPassword(receiverPassword, salt, forceFallback);
+        const authIvBuf = hexToBuf(file.authIv);
+        const encryptedTokenBuf = hexToBuf(file.authToken);
+        
+        let decrypted;
+        try {
+          decrypted = await decryptBuffer(encryptedTokenBuf, testKey, authIvBuf, forceFallback);
+        } catch {
+          setPasswordError('Incorrect password. Please try again.');
+          setReceiverPassword('');
+          return;
+        }
+        
+        const decoded = new TextDecoder().decode(decrypted);
+        if (decoded !== 'fashshare-auth-verification-token') {
+          setPasswordError('Incorrect password. Please try again.');
+          setReceiverPassword('');
+          return;
+        }
+      } catch (err) {
+        console.error('Password pre-verification error:', err);
+        setPasswordError('Incorrect password. Please try again.');
+        setReceiverPassword('');
+        return;
+      }
     }
+
+    setPasswordError('');
+    setShowPasswordPrompt(false);
+    startDownloadRequest(file);
   };
 
   // Sender: accept a download request
@@ -696,6 +838,10 @@ const FileSharePage = () => {
           setTransferStatus('File transferred successfully!');
           setTransferProgress(100);
           closePc();
+          setTimeout(() => {
+            setTransferStatus('');
+            setTransferProgress(0);
+          }, 2000);
         }
         if (msg.type === 'pause') {
           console.log('Pause requested by remote peer');
@@ -718,6 +864,7 @@ const FileSharePage = () => {
     };
 
     dc.onerror = (err) => {
+      if (dcRef.current !== dc) return;
       const errorMsg = err?.error?.message || err?.message || '';
       if (errorMsg.includes('Close called') || errorMsg.includes('User-Initiated Abort')) {
         console.log('Data channel closed cleanly by user cancellation.');
@@ -729,6 +876,7 @@ const FileSharePage = () => {
     };
 
     dc.onclose = () => {
+      if (dcRef.current !== dc) return;
       console.log('Data channel closed');
       setTransferStatus('Connection closed');
       closePc();
@@ -933,60 +1081,181 @@ const FileSharePage = () => {
 
   if (showRoomForm) {
     return (
-      <div className={`min-h-screen ${theme.background} flex items-center justify-center`}>
-        <div className={`${theme.card} border rounded-xl p-8 max-w-md w-full mx-4 shadow-2xl space-y-6`}>
-          <h2 className={`text-2xl font-bold ${theme.text} text-center flex items-center justify-center gap-2`}>
-            Create a Secure Room
-          </h2>
-          <form onSubmit={handleCreateRoom} className="space-y-4">
-            <div>
-              <label className={`block text-sm font-medium ${theme.text} mb-2`}>Room Name</label>
-              <input
-                type="text"
-                value={roomName}
-                onChange={(e) => setRoomName(e.target.value)}
-                className={`w-full px-4 py-3 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
-                placeholder="Enter room name"
-                required
-              />
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className={`block text-sm font-medium ${theme.text} mb-2 flex items-center gap-1`}>
-                  <Clock className="h-4 w-4 text-blue-500" /> Link Expiry
-                </label>
-                <select
-                  value={expiresAfter}
-                  onChange={(e) => setExpiresAfter(e.target.value)}
-                  className={`w-full px-3 py-2.5 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
-                >
-                  <option value="0">Never</option>
-                  <option value="5">5 Minutes</option>
-                  <option value="10">10 Minutes</option>
-                  <option value="60">1 Hour</option>
-                </select>
-              </div>
-              <div className="flex flex-col justify-end">
-                <label className={`flex items-center gap-2 cursor-pointer text-sm font-medium ${theme.text} mb-3`}>
-                  <input
-                    type="checkbox"
-                    checked={oneTimeDownload}
-                    onChange={(e) => setOneTimeDownload(e.target.checked)}
-                    className="h-4 w-4 text-blue-500 border-gray-300 rounded focus:ring-blue-500"
-                  />
-                  One-time Room
-                </label>
-              </div>
-            </div>
-
+      <div className={`min-h-screen ${theme.background} flex items-center justify-center pt-24 pb-12`}>
+        <div className={`${theme.card} border rounded-xl p-8 max-w-lg w-full mx-4 shadow-2xl space-y-6 bg-slate-900/40 backdrop-blur-md`}>
+          
+          {/* Tabs for Sharing Mode Selection */}
+          <div className="flex bg-black/40 p-1.5 rounded-xl border border-white/5">
             <button
-              type="submit"
-              className={`w-full ${theme.primary} ${theme.text} py-3 px-6 rounded-lg font-semibold ${theme.hover}`}
+              onClick={() => setSharingMode('internet')}
+              className={`flex-1 py-3 px-4 rounded-lg font-bold flex items-center justify-center space-x-2 transition-all text-sm ${
+                sharingMode === 'internet'
+                  ? 'bg-blue-600 text-white shadow-md'
+                  : 'text-gray-400 hover:text-white hover:bg-white/5'
+              }`}
             >
-              Create Room
+              <Globe className="h-4 w-4" />
+              <span>Internet Mode</span>
             </button>
-          </form>
+            <button
+              onClick={() => setSharingMode('local')}
+              className={`flex-1 py-3 px-4 rounded-lg font-bold flex items-center justify-center space-x-2 transition-all text-sm ${
+                sharingMode === 'local'
+                  ? 'bg-purple-600 text-white shadow-md'
+                  : 'text-gray-400 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Wifi className="h-4 w-4" />
+              <span>Local Mode</span>
+            </button>
+          </div>
+
+          <div className="space-y-6">
+            {/* Create Room Section */}
+            <div className="space-y-4">
+              <h3 className={`text-lg font-bold ${theme.text} flex items-center gap-2`}>
+                <Plus className="h-5 w-5 text-blue-500" />
+                <span>{sharingMode === 'local' ? 'Start Local Room Manager' : 'Create a Secure Room'}</span>
+              </h3>
+              
+              <form onSubmit={handleCreateRoom} className="space-y-4">
+                <div>
+                  <label className={`block text-xs font-semibold ${theme.textSecondary} mb-2 uppercase tracking-wider`}>Room Name</label>
+                  <input
+                    type="text"
+                    value={roomName}
+                    onChange={(e) => setRoomName(e.target.value)}
+                    className={`w-full px-4 py-3 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                    placeholder="e.g. My Workspace Share"
+                    required
+                  />
+                </div>
+
+                {sharingMode === 'internet' && (
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className={`block text-xs font-semibold ${theme.textSecondary} mb-2 uppercase tracking-wider flex items-center gap-1`}>
+                        <Clock className="h-4 w-4 text-blue-500" /> Link Expiry
+                      </label>
+                      <select
+                        value={expiresAfter}
+                        onChange={(e) => setExpiresAfter(e.target.value)}
+                        className={`w-full px-3 py-2.5 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                      >
+                        <option value="0">Never</option>
+                        <option value="5">5 Minutes</option>
+                        <option value="10">10 Minutes</option>
+                        <option value="60">1 Hour</option>
+                      </select>
+                    </div>
+                    <div className="flex flex-col justify-end">
+                      <label className={`flex items-center gap-2 cursor-pointer text-sm font-medium ${theme.text} mb-3`}>
+                        <input
+                          type="checkbox"
+                          checked={oneTimeDownload}
+                          onChange={(e) => setOneTimeDownload(e.target.checked)}
+                          className="h-4 w-4 text-blue-500 border-gray-300 rounded focus:ring-blue-500"
+                        />
+                        One-time Room
+                      </label>
+                    </div>
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  className={`w-full ${sharingMode === 'local' ? 'bg-purple-600 hover:bg-purple-700 text-white' : `${theme.primary} ${theme.hover} ${theme.text}`} py-3 px-6 rounded-lg font-bold flex items-center justify-center space-x-2 shadow-lg transition-all transform active:scale-95`}
+                >
+                  {sharingMode === 'local' ? (
+                    <>
+                      <Wifi className="h-5 w-5 animate-pulse" />
+                      <span>Start Advertising local room</span>
+                    </>
+                  ) : (
+                    <>
+                      <Globe className="h-5 w-5" />
+                      <span>Create room</span>
+                    </>
+                  )}
+                </button>
+              </form>
+            </div>
+
+            {/* Separator */}
+            <div className="relative flex py-2 items-center">
+              <div className="flex-grow border-t border-gray-700/50"></div>
+              <span className="flex-shrink mx-4 text-gray-500 text-xs font-bold uppercase tracking-wider">or</span>
+              <div className="flex-grow border-t border-gray-700/50"></div>
+            </div>
+
+            {/* Interactive Join Section */}
+            {sharingMode === 'internet' ? (
+              <div className="space-y-4">
+                <h3 className={`text-lg font-bold ${theme.text} flex items-center gap-2`}>
+                  <Link className="h-5 w-5 text-indigo-500" />
+                  <span>Join Room via Code</span>
+                </h3>
+                <form onSubmit={handleManualJoin} className="flex space-x-2">
+                  <input
+                    type="text"
+                    value={joinRoomId}
+                    onChange={(e) => setJoinRoomId(e.target.value)}
+                    placeholder="Enter Room Code (UUID)"
+                    required
+                    className={`flex-1 px-4 py-3 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm`}
+                  />
+                  <button
+                    type="submit"
+                    className={`px-5 py-3 ${theme.primary} ${theme.text} rounded-lg font-bold ${theme.hover} transition-all transform active:scale-95 text-sm flex items-center space-x-1`}
+                  >
+                    <Search className="h-4 w-4" />
+                    <span>Join</span>
+                  </button>
+                </form>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <h3 className={`text-lg font-bold ${theme.text} flex items-center gap-2`}>
+                  <Wifi className="h-5 w-5 text-purple-500 animate-pulse" />
+                  <span>Discovered Nearby Rooms</span>
+                </h3>
+                
+                {discoveredRooms.length === 0 ? (
+                  <div className="p-6 border border-dashed border-gray-700 rounded-xl text-center bg-black/20">
+                    <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-purple-500 mx-auto mb-3" />
+                    <p className={`${theme.textSecondary} text-sm font-semibold`}>Scanning local network for rooms...</p>
+                    <p className="text-gray-500 text-xs mt-1">Make sure you are connected to the same Wi-Fi</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3.5 max-h-48 overflow-y-auto pr-1">
+                    {discoveredRooms.map((room) => (
+                      <div
+                        key={room.roomId}
+                        className="p-4 bg-black/40 border border-white/5 hover:border-purple-500/30 rounded-xl flex items-center justify-between transition-all"
+                      >
+                        <div className="space-y-1">
+                          <p className={`font-bold text-sm ${theme.text}`}>{room.roomName}</p>
+                          <p className="text-gray-400 text-xs flex items-center gap-1">
+                            <span>👤 Host:</span>
+                            <span className="text-white font-medium">{room.hostName}</span>
+                            <span className="text-gray-600">•</span>
+                            <span className="font-mono text-purple-400">{room.ip}</span>
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => joinLocalRoom(room.roomId, room.ip, room.port)}
+                          className="bg-purple-600 hover:bg-purple-700 text-white font-bold text-xs px-4 py-2 rounded-lg shadow-md transition-all transform active:scale-95"
+                        >
+                          Join
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
         </div>
       </div>
     );
@@ -1015,12 +1284,18 @@ const FileSharePage = () => {
               <input
                 type="password"
                 value={receiverPassword}
-                onChange={(e) => setReceiverPassword(e.target.value)}
-                className={`w-full px-4 py-3 rounded-lg border ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                onChange={(e) => { setReceiverPassword(e.target.value); setPasswordError(''); }}
+                className={`w-full px-4 py-3 rounded-lg border ${passwordError ? 'border-red-500 ring-2 ring-red-500/40' : ''} ${theme.card} ${theme.text} focus:outline-none focus:ring-2 focus:ring-blue-500`}
                 placeholder="Enter password"
                 required
                 autoFocus
               />
+              {passwordError && (
+                <p className="text-red-400 text-sm font-medium flex items-center gap-1.5">
+                  <Shield className="h-4 w-4 flex-shrink-0" />
+                  {passwordError}
+                </p>
+              )}
               <button
                 type="submit"
                 className={`w-full ${theme.primary} ${theme.text} py-3 rounded-lg font-semibold ${theme.hover}`}
@@ -1038,9 +1313,28 @@ const FileSharePage = () => {
           <div className="lg:col-span-2 space-y-6">
             {/* Sender Section */}
             <div className={`${theme.card} border rounded-xl p-8 shadow-md`}>
-              <h2 className={`text-2xl font-bold ${theme.text} mb-6 flex items-center gap-2`}>
-                <Sparkles className="text-blue-500 h-6 w-6" /> E2E Encrypted File Share
-              </h2>
+              <div className="flex justify-between items-center mb-6 flex-wrap gap-3">
+                <h2 className={`text-2xl font-bold ${theme.text} flex items-center gap-2`}>
+                  <Sparkles className="text-blue-500 h-6 w-6" /> E2E Encrypted File Share
+                </h2>
+                {currentRoom && (
+                  <span className={`text-xs font-bold px-3 py-1 rounded-full flex items-center gap-1.5 shadow-sm border ${
+                    currentRoom.isLocal 
+                      ? 'bg-purple-500/10 text-purple-400 border-purple-500/30 shadow-purple-950/20' 
+                      : 'bg-blue-500/10 text-blue-400 border-blue-500/30 shadow-blue-950/20'
+                  }`}>
+                    {currentRoom.isLocal ? (
+                      <>
+                        <Wifi className="h-3.5 w-3.5 animate-pulse" /> Local LAN Mode
+                      </>
+                    ) : (
+                      <>
+                        <Globe className="h-3.5 w-3.5" /> Internet Mode
+                      </>
+                    )}
+                  </span>
+                )}
+              </div>
               
               <div
                 className={`border-2 border-dashed rounded-lg p-8 text-center transition-all duration-300 ${
@@ -1161,7 +1455,9 @@ const FileSharePage = () => {
                         <p className={`${theme.text} font-semibold`}>
                           {req.requesterName} wants to download a file
                         </p>
-                        <p className={`${theme.textSecondary} text-sm`}>File ID: {req.fileId}</p>
+                        <p className={`${theme.textSecondary} text-sm`}>
+                          {myOfferedFiles.find(f => f.id === req.fileId)?.name || req.fileId}
+                        </p>
                       </div>
                       <div className="flex space-x-2">
                         <button
@@ -1185,8 +1481,8 @@ const FileSharePage = () => {
               </div>
             )}
 
-            {/* Transfer Progress & Status */}
-            {(isTransferring || transferProgress > 0) && (
+            {/* Transfer Progress & Status — only visible while a transfer is actually in progress */}
+            {isTransferring && (
               <div className="mt-6 p-6 rounded-2xl bg-gradient-to-br from-indigo-950/80 via-slate-900/90 to-purple-950/80 border border-indigo-500/30 backdrop-blur-xl shadow-2xl relative overflow-hidden">
                 {/* Glow decorations */}
                 <div className="absolute -top-12 -left-12 w-24 h-24 bg-indigo-500/20 rounded-full blur-2xl" />
@@ -1285,6 +1581,12 @@ const FileSharePage = () => {
                   <div>
                     <p className={`${theme.textSecondary} text-sm`}>Room ID</p>
                     <p className={`${theme.text} font-mono text-sm break-all`}>{currentRoom.id}</p>
+                  </div>
+                  <div>
+                    <p className={`${theme.textSecondary} text-sm`}>Sharing Mode</p>
+                    <p className={`font-semibold text-sm ${currentRoom.isLocal ? 'text-purple-400' : 'text-blue-400'}`}>
+                      {currentRoom.isLocal ? '🏠 Local Network (LAN)' : '🌐 Internet (Global)'}
+                    </p>
                   </div>
                   {currentRoom.expiresAt && (
                     <div>
