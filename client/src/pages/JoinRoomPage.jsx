@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { useParams } from 'react-router-dom';
-import { Upload, Link, Users, Send, X, Download, Check, XCircle, Shield, Key, Sparkles, Clock, Globe, Wifi } from 'lucide-react';
+import { useParams, useNavigate } from 'react-router-dom';
+import { Upload, Link, Users, Send, X, Download, Check, XCircle, Shield, Key, Sparkles, Clock, Globe, Wifi, LogOut, DoorOpen } from 'lucide-react';
 import QRCode from 'qrcode';
 import { useTheme } from '../contexts/ThemeContext';
 import { useSocket } from '../contexts/SocketContext';
+import ConfirmModal from '../components/ConfirmModal';
 import {
   calculateHash,
   deriveKeyFromPassword,
@@ -37,6 +38,17 @@ const hexToBuf = (hex) => {
   return bytes.buffer;
 };
 
+// Derive unique IV for a chunk index based on baseIv
+const deriveChunkIv = (baseIv, chunkIndex) => {
+  const iv = new Uint8Array(baseIv.byteLength || baseIv.length);
+  iv.set(new Uint8Array(baseIv));
+  const view = new DataView(iv.buffer);
+  const ivLength = iv.length;
+  const currentVal = view.getUint32(ivLength - 4, false);
+  view.setUint32(ivLength - 4, currentVal ^ chunkIndex, false);
+  return iv;
+};
+
 const JoinRoomPage = () => {
   const { roomId } = useParams();
   const { theme } = useTheme();
@@ -47,10 +59,23 @@ const JoinRoomPage = () => {
     joinAsUser,
     joinRoom,
     createRoom,
+    closeRoom,
+    leaveRoom,
     currentRoom,
     roomUsers,
     roomError
   } = useSocket();
+
+  const navigate = useNavigate();
+
+  // Redirect all users back to home when the room is destroyed
+  const prevRoomRef = useRef(currentRoom);
+  useEffect(() => {
+    if (prevRoomRef.current && !currentRoom) {
+      navigate('/');
+    }
+    prevRoomRef.current = currentRoom;
+  }, [currentRoom, navigate]);
 
   // State for user/room forms
   const [userName, setUserName] = useState(user?.name || '');
@@ -83,6 +108,9 @@ const JoinRoomPage = () => {
   const [selectedFileToDownload, setSelectedFileToDownload] = useState(null);
   const [passwordError, setPasswordError] = useState('');
 
+  // Custom confirm modal state
+  const [confirmModal, setConfirmModal] = useState({ open: false, title: '', message: '', danger: false, confirmLabel: 'Confirm', onConfirm: null });
+
   const fileInputRef = useRef(null);
   const pcRef = useRef(null);           // RTCPeerConnection
   const dcRef = useRef(null);           // RTCDataChannel
@@ -94,6 +122,7 @@ const JoinRoomPage = () => {
   // Encryption keys & prepared send buffer
   const senderBufferRef = useRef(null);
   const fileMetaRef = useRef(null);
+  const receiverKeyRef = useRef(null);
 
   // Speed, remaining time, and pause/resume states
   const [transferSpeed, setTransferSpeed] = useState('');
@@ -120,11 +149,36 @@ const JoinRoomPage = () => {
     receiverPasswordRef.current = receiverPassword;
   }, [receiverPassword]);
 
+  // Screen Wake Lock to prevent mobile browsers from sleeping/suspending JS execution
+  const wakeLockRef = useRef(null);
+  
+  const requestWakeLock = async () => {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLockRef.current = await navigator.wakeLock.request('screen');
+        console.log('Screen Wake Lock acquired.');
+      }
+    } catch (err) {
+      console.warn('Wake Lock request failed:', err);
+    }
+  };
+  
+  const releaseWakeLock = () => {
+    if (wakeLockRef.current) {
+      try {
+        wakeLockRef.current.release();
+        console.log('Screen Wake Lock released.');
+      } catch (e) {}
+      wakeLockRef.current = null;
+    }
+  };
+
   // Helper: close any existing peer connection
   const closePc = () => {
     if (dcRef.current) { try { dcRef.current.close(); } catch(e){} dcRef.current = null; }
     if (pcRef.current) { try { pcRef.current.close(); } catch(e){} pcRef.current = null; }
     candidateQueueRef.current = [];
+    releaseWakeLock();
     resetTransferStats();
   };
 
@@ -172,7 +226,8 @@ const JoinRoomPage = () => {
 
     const onFileOffered = (data) => {
       setOfferedFiles(prev => {
-        if (prev.some(f => (f.fileId || f.id) === data.fileId)) return prev;
+        // Deduplicate by fileId OR by (senderId + fileName)
+        if (prev.some(f => (f.fileId || f.id) === data.fileId || (f.senderId === data.senderId && f.name === data.fileName))) return prev;
         return [...prev, {
           id: data.fileId,
           name: data.fileName,
@@ -384,7 +439,11 @@ const JoinRoomPage = () => {
             console.log('Data channel closed cleanly by user cancellation.');
           } else {
             console.error('Data channel error:', err);
-            setTransferStatus('Transfer error');
+            if (receivingFileRef.current) {
+              setTransferStatus('❌ Connection lost. Reconnect and click Download again to resume from where it stopped.');
+            } else {
+              setTransferStatus('Transfer error');
+            }
           }
           closePc();
         };
@@ -392,7 +451,11 @@ const JoinRoomPage = () => {
         dc.onclose = () => {
           if (dcRef.current !== dc) return;
           console.log('Data channel closed');
-          setTransferStatus('Connection closed');
+          if (receivingFileRef.current) {
+            setTransferStatus('❌ Connection lost. Reconnect and click Download again to resume from where it stopped.');
+          } else {
+            setTransferStatus('Connection closed');
+          }
           closePc();
         };
       };
@@ -438,9 +501,25 @@ const JoinRoomPage = () => {
       setTransferStatus(`Transfer progress: ${data.progress}%`);
     };
 
+    // Receiver: sender rejected the download request
+    const onFileRejected = (data) => {
+      console.log('File request rejected by sender:', data);
+      receivingFileRef.current = null;
+      receivedChunksRef.current = [];
+      setTransferStatus(`❌ Request rejected by ${data.senderName || 'sender'} for "${data.fileName || 'file'}".`);
+      setTimeout(() => setTransferStatus(''), 4000);
+    };
+
+    // Receiver: a file offer was retracted by the sender
+    const onFileRemoved = (data) => {
+      setOfferedFiles(prev => prev.filter(f => f.id !== data.fileId));
+    };
+
     socket.on('file:offered', onFileOffered);
     socket.on('room:joined', onRoomJoined);
     socket.on('file:requested', onFileRequested);
+    socket.on('file:rejected', onFileRejected);
+    socket.on('file:removed', onFileRemoved);
     socket.on('transfer:progress', onTransferProgress);
     socket.on('rtc:offer', onRtcOffer);
     socket.on('rtc:answer', onRtcAnswer);
@@ -450,12 +529,20 @@ const JoinRoomPage = () => {
       socket.off('file:offered', onFileOffered);
       socket.off('room:joined', onRoomJoined);
       socket.off('file:requested', onFileRequested);
+      socket.off('file:rejected', onFileRejected);
+      socket.off('file:removed', onFileRemoved);
       socket.off('transfer:progress', onTransferProgress);
       socket.off('rtc:offer', onRtcOffer);
       socket.off('rtc:answer', onRtcAnswer);
       socket.off('rtc:ice-candidate', onRtcIceCandidate);
     };
   }, [socket]);
+
+  useEffect(() => {
+    return () => {
+      releaseWakeLock();
+    };
+  }, []);
 
   // Reset state and generate URLs when room changes
   useEffect(() => {
@@ -514,106 +601,60 @@ const JoinRoomPage = () => {
     try {
       const file = receivingFileRef.current;
       const chunks = receivedChunksRef.current;
-      
-      const totalLength = chunks.reduce((acc, c) => acc + c.byteLength, 0);
-      const combinedBuffer = new Uint8Array(totalLength);
-      
-      let offset = 0;
-      for (const chunk of chunks) {
-        combinedBuffer.set(new Uint8Array(chunk), offset);
-        offset += chunk.byteLength;
-      }
-      
-      let finalBuffer = combinedBuffer.buffer;
-      
-      setTransferStatus('Decrypting secure file end-to-end...');
-      const iv = hexToBuf(file.iv);
-      let key;
+      const key = receiverKeyRef.current;
+      const baseIv = hexToBuf(file.iv);
       const forceFallback = !crypto.subtle || file.encryptionType === 'fallback' || currentRoomRef.current?.isLocal;
       
-      if (file.isPasswordProtected) {
-        const salt = hexToBuf(file.salt);
-        key = await deriveKeyFromPassword(receiverPasswordRef.current, salt, forceFallback);
-      } else {
-        const dummySalt = new Uint8Array(16);
-        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt, forceFallback);
-      }
+      setTransferStatus('Decrypting file...');
       
-      try {
-        finalBuffer = await decryptBuffer(finalBuffer, key, iv, forceFallback);
-      } catch (err) {
-        console.error('Decryption failed:', err);
-        setTransferStatus('Error: Incorrect password or corrupted data. Decryption failed.');
-        setTransferProgress(0);
-        return;
-      }
-      
-      if (file.isCompressed) {
-        setTransferStatus('Decompressing file contents...');
+      // Decrypt each chunk individually using per-chunk IV
+      const decryptedChunks = [];
+      for (let i = 0; i < chunks.length; i++) {
+        if (!chunks[i]) continue;
+        const chunkIv = deriveChunkIv(baseIv, i);
+        let decrypted;
         try {
-          finalBuffer = await decompressBuffer(finalBuffer);
+          decrypted = await decryptBuffer(chunks[i], key, chunkIv, forceFallback);
         } catch (err) {
-          console.error('Decompression failed:', err);
-          setTransferStatus('Error: Decompression failed.');
+          console.error(`Chunk ${i} decryption failed:`, err);
+          setTransferStatus('Error: Decryption failed. Incorrect password or corrupted data.');
+          setTransferProgress(0);
           return;
+        }
+        decryptedChunks.push(decrypted);
+        if (i % 50 === 0 && chunks.length > 50) {
+          setTransferStatus(`Decrypting: ${Math.round((i / chunks.length) * 100)}%`);
+          await new Promise(r => setTimeout(r, 0));
         }
       }
       
-      setTransferStatus('Verifying file integrity...');
-      const receivedHash = await calculateHash(finalBuffer, forceFallback);
-      if (receivedHash !== file.fileHash) {
-        console.error('Hash mismatch! File integrity compromised.');
-        setTransferStatus('Error: Integrity check failed (SHA-256 mismatch).');
-        return;
-      }
-      
       setTransferStatus('Saving file...');
-
-      // Chrome blocks blob: URL downloads over insecure HTTP (local mode).
-      // Use a base64 data URI in that case – it is never blocked.
-      const isSecureContext = window.isSecureContext;
-      const blob = new Blob([finalBuffer]);
+      const blob = new Blob(decryptedChunks, { type: 'application/octet-stream' });
       const a = document.createElement('a');
       a.download = file.name || 'downloaded_file';
       a.style.display = 'none';
       document.body.appendChild(a);
-
-      if (isSecureContext) {
-        // HTTPS / localhost – use fast blob URL
-        const blobUrl = URL.createObjectURL(blob);
-        a.href = blobUrl;
-        a.click();
-        setTimeout(() => {
-          document.body.removeChild(a);
-          URL.revokeObjectURL(blobUrl);
-        }, 1000);
-      } else {
-        // Local HTTP (e.g. http://172.16.x.x) – convert to data URI
-        const reader = new FileReader();
-        reader.onload = () => {
-          a.href = reader.result;
-          a.click();
-          setTimeout(() => {
-            try { document.body.removeChild(a); } catch(e) {}
-          }, 1000);
-        };
-        reader.readAsDataURL(blob);
-      }
+      const blobUrl = URL.createObjectURL(blob);
+      a.href = blobUrl;
+      a.click();
+      setTimeout(() => {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+      }, 1000);
 
       setTransferProgress(100);
       setTransferStatus(`✅ Downloaded: ${file.name}`);
-      setIsTransferring(false); // Hide progress bar immediately
+      setIsTransferring(false);
       socketRef.current?.emit('transfer:complete', { fileId: file.id });
       console.log('Receiver successfully assembled and downloaded the file.');
 
-      // Clean up chunk state immediately after download triggered
       receivedChunksRef.current = [];
       receivingFileRef.current = null;
+      receiverKeyRef.current = null;
 
       setTimeout(() => {
         setTransferProgress(0);
         setTransferStatus('');
-        // Close peer connection after brief delay (let transfer_complete signal through)
         closePc();
       }, 2000);
 
@@ -657,50 +698,50 @@ const JoinRoomPage = () => {
   // Sender: Prepare & Share file
   const handleFileOffer = async () => {
     if (!selectedFile) { setTransferStatus('No file selected'); return; }
-    if (!currentRoom?.id) { setTransferStatus('Room is not ready.'); return; }
+    if (!socket) { setTransferStatus('Not connected to server'); return; }
+    if (!currentRoom?.id) { setTransferStatus('Room is not ready. Please try again.'); return; }
 
-    setTransferStatus('Encrypting and compressing file...');
+    setTransferStatus('Preparing secure file share...');
     setTransferProgress(10);
     
     try {
-      const originalBuffer = await selectedFile.arrayBuffer();
-      const fileHash = await calculateHash(originalBuffer);
-      
-      let finalBuffer = originalBuffer;
-      let isCompressed = false;
-      
-      if (shouldCompress(selectedFile.name)) {
-        const compressed = await compressBuffer(originalBuffer);
-        if (compressed.byteLength < originalBuffer.byteLength * 0.95) {
-          finalBuffer = compressed;
-          isCompressed = true;
-        }
-      }
-      
+      const forceFallback = !crypto.subtle || currentRoom?.isLocal;
+
       let salt = null;
       let key;
       const iv = crypto.getRandomValues(new Uint8Array(12));
+      let authToken = null;
+      let authIv = null;
       
       if (isPasswordProtected && password) {
         salt = crypto.getRandomValues(new Uint8Array(16));
-        key = await deriveKeyFromPassword(password, salt);
+        key = await deriveKeyFromPassword(password, salt, forceFallback);
+        
+        // Encrypt the static validation string to create a password verifier
+        authIv = crypto.getRandomValues(new Uint8Array(12));
+        const verifierBuffer = new TextEncoder().encode('fashshare-auth-verification-token');
+        const encryptedVerifier = await encryptBuffer(verifierBuffer.buffer, key, authIv, forceFallback);
+        authToken = bufToHex(encryptedVerifier);
       } else {
         const dummySalt = new Uint8Array(16);
-        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt);
+        key = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt, forceFallback);
       }
       
-      const encryptedBuffer = await encryptBuffer(finalBuffer, key, iv);
-      senderBufferRef.current = encryptedBuffer;
-
       const fileId = Date.now().toString();
       
+      // Store locally
       setMyOfferedFiles(prev => [...prev, {
         id: fileId,
         file: selectedFile,
         name: selectedFile.name,
-        size: selectedFile.size
+        size: selectedFile.size,
+        key,
+        iv,
+        salt,
+        isPasswordProtected: isPasswordProtected && !!password
       }]);
       
+      // Emit details
       const offerPayload = {
         roomId: currentRoom.id,
         fileName: selectedFile.name,
@@ -709,9 +750,12 @@ const JoinRoomPage = () => {
         isPasswordProtected: isPasswordProtected && !!password,
         salt: salt ? bufToHex(salt) : null,
         iv: bufToHex(iv),
-        isCompressed,
-        fileHash,
-        oneTimeDownload
+        isCompressed: false,
+        fileHash: 'streamed',
+        oneTimeDownload,
+        encryptionType: forceFallback ? 'fallback' : 'aes-gcm',
+        authToken,
+        authIv: authIv ? bufToHex(authIv) : null
       };
       
       socket.emit('file:offer', offerPayload);
@@ -727,8 +771,8 @@ const JoinRoomPage = () => {
       setFileShared(true);
       
     } catch (err) {
-      console.error('File encryption failed:', err);
-      setTransferStatus('Failed to encrypt file: ' + err.message);
+      console.error('File preparation failed:', err);
+      setTransferStatus('Failed to prepare file: ' + err.message);
       setTransferProgress(0);
     }
   };
@@ -748,9 +792,25 @@ const JoinRoomPage = () => {
     }
   };
 
-  const startDownloadRequest = (file) => {
-    receivedChunksRef.current = [];
+  const startDownloadRequest = async (file) => {
+    if (!receivingFileRef.current || receivingFileRef.current.id !== file.id) {
+      receivedChunksRef.current = [];
+    }
     receivingFileRef.current = file;
+    requestWakeLock();
+    // Pre-derive decryption key for chunk-by-chunk decryption during assembly
+    try {
+      const forceFallback = !crypto.subtle || file.encryptionType === 'fallback' || currentRoomRef.current?.isLocal;
+      if (file.isPasswordProtected) {
+        const salt = hexToBuf(file.salt);
+        receiverKeyRef.current = await deriveKeyFromPassword(receiverPasswordRef.current, salt, forceFallback);
+      } else {
+        const dummySalt = new Uint8Array(16);
+        receiverKeyRef.current = await deriveKeyFromPassword('fashshare-session-key-fallback-direct-webrtc-e2e', dummySalt, forceFallback);
+      }
+    } catch (err) {
+      console.error('Failed to derive decryption key:', err);
+    }
     socket.emit('file:request', { fileId: file.id, candidateId: socket.id });
     setTransferStatus(`Requesting connection to sender for ${file.name}...`);
   };
@@ -810,6 +870,7 @@ const JoinRoomPage = () => {
 
     console.log('Creating native RTCPeerConnection as initiator for', request.requesterName);
     closePc();
+    requestWakeLock();
 
     const pc = new RTCPeerConnection(ICE_SERVERS);
     pcRef.current = pc;
@@ -828,18 +889,13 @@ const JoinRoomPage = () => {
       console.log('Data channel open – sending file metadata');
       setTransferStatus('Connected – exchanging protocol meta…');
       
-      const buffer = senderBufferRef.current;
-      if (buffer) {
-        const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
-        console.log(`Sending meta to receiver: fileId=${request.fileId}, totalChunks=${totalChunks}`);
-        dc.send(JSON.stringify({
-          type: 'meta',
-          fileId: request.fileId,
-          totalChunks
-        }));
-      } else {
-        console.error('No prepared encrypted buffer found to send in onopen');
-      }
+      const totalChunks = Math.ceil(myFile.file.size / CHUNK_SIZE);
+      console.log(`Sending meta to receiver: fileId=${request.fileId}, totalChunks=${totalChunks}`);
+      dc.send(JSON.stringify({
+        type: 'meta',
+        fileId: request.fileId,
+        totalChunks
+      }));
     };
 
     dc.onmessage = (evt) => {
@@ -848,11 +904,11 @@ const JoinRoomPage = () => {
         if (msg.type === 'ready') {
           console.log(`Receiver is ready! Starting chunk send from index: ${msg.nextChunkIndex}`);
           setTransferStatus('Sending file chunks...');
-          sendFileChunks(dc, msg.nextChunkIndex, request.fileId);
+          sendFileChunks(dc, msg.nextChunkIndex, request.fileId, myFile.file, myFile.key, myFile.iv);
         }
         if (msg.type === 'resend_chunks') {
           console.log('Receiver requested resend of chunks:', msg.indices);
-          resendChunks(dc, msg.indices);
+          resendChunks(dc, msg.indices, myFile.file, myFile.key, myFile.iv);
         }
         if (msg.type === 'transfer_complete') {
           console.log('Receiver successfully assembled and downloaded the file.');
@@ -889,19 +945,47 @@ const JoinRoomPage = () => {
     setTransferStatus('Waiting for receiver to accept WebRTC connection…');
   };
 
-  const sendFileChunks = async (dc, startIndex, fileId) => {
-    const buffer = senderBufferRef.current;
-    if (!buffer) return;
+  const sendFileChunks = async (dc, startIndex, fileId, file, key, iv) => {
+    if (!file) return;
     
-    const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
+    setIsTransferring(true);
+    startTimeRef.current = Date.now();
     
-    const LOW_WATER = 256 * 1024; // 256KB
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const forceFallback = !crypto.subtle || currentRoomRef.current?.isLocal;
+    
+    dc.bufferedAmountLowThreshold = 65536; // 64KB
     const waitForDrain = () => new Promise(resolve => {
-      if (dc.bufferedAmount <= LOW_WATER) { resolve(); return; }
+      if (dc.bufferedAmount <= dc.bufferedAmountLowThreshold) {
+        resolve();
+        return;
+      }
+      
+      let resolved = false;
+      const onLow = () => {
+        if (resolved) return;
+        resolved = true;
+        dc.removeEventListener('bufferedamountlow', onLow);
+        resolve();
+      };
+      
+      dc.addEventListener('bufferedamountlow', onLow);
+      
       const check = () => {
-        if (dc.readyState !== 'open') { resolve(); return; }
-        if (dc.bufferedAmount <= LOW_WATER) { resolve(); }
-        else { setTimeout(check, 50); }
+        if (resolved) return;
+        if (dc.readyState !== 'open') {
+          resolved = true;
+          dc.removeEventListener('bufferedamountlow', onLow);
+          resolve();
+          return;
+        }
+        if (dc.bufferedAmount <= dc.bufferedAmountLowThreshold) {
+          resolved = true;
+          dc.removeEventListener('bufferedamountlow', onLow);
+          resolve();
+        } else {
+          setTimeout(check, 50);
+        }
       };
       setTimeout(check, 50);
     });
@@ -913,26 +997,49 @@ const JoinRoomPage = () => {
       if (dc.readyState !== 'open') return;
       
       const offset = index * CHUNK_SIZE;
-      const size = Math.min(CHUNK_SIZE, buffer.byteLength - offset);
-      const chunkData = buffer.slice(offset, offset + size);
+      const size = Math.min(CHUNK_SIZE, file.size - offset);
+      const blobSlice = file.slice(offset, offset + size);
       
-      const messageBuffer = new ArrayBuffer(8 + chunkData.byteLength);
+      let chunkData;
+      try {
+        chunkData = await blobSlice.arrayBuffer();
+      } catch (err) {
+        console.error('Failed to read chunk from file:', err);
+        setTransferStatus('Failed to read file chunk: ' + err.message);
+        return;
+      }
+      
+      const chunkIv = deriveChunkIv(iv, index);
+      const encryptedChunk = await encryptBuffer(chunkData, key, chunkIv, forceFallback);
+      
+      const messageBuffer = new ArrayBuffer(8 + encryptedChunk.byteLength);
       const view = new DataView(messageBuffer);
       view.setUint32(0, index);
       view.setUint32(4, totalChunks);
-      
       const payload = new Uint8Array(messageBuffer);
-      payload.set(new Uint8Array(chunkData), 8);
-      
+      payload.set(new Uint8Array(encryptedChunk), 8);
       dc.send(messageBuffer);
       
+      // Stats
+      const elapsed = (Date.now() - startTimeRef.current) / 1000;
+      if (elapsed > 0.1 && index % 5 === 0) {
+        const bytesSent = (index - startIndex) * CHUNK_SIZE;
+        const speedBytes = bytesSent / elapsed;
+        let speedStr = speedBytes > 1048576
+          ? `${(speedBytes / 1048576).toFixed(2)} MB/s`
+          : `${(speedBytes / 1024).toFixed(1)} KB/s`;
+        setTransferSpeed(speedStr);
+        setTimeElapsed(`${Math.round(elapsed)}s elapsed`);
+        if (speedBytes > 0) {
+          const remSecs = Math.round(((totalChunks - index) * CHUNK_SIZE) / speedBytes);
+          setTimeRemaining(`${remSecs}s remaining`);
+        }
+      }
       const progress = Math.round((index / totalChunks) * 100);
-      setTransferProgress(progress);
+      setTransferProgress(prev => prev !== progress ? progress : prev);
       if (progress % 5 === 0) {
         socketRef.current?.emit('transfer:progress', { fileId, progress, direction: 'upload' });
       }
-      
-      await new Promise(resolve => setTimeout(resolve, 0));
     }
     
     if (dc.readyState === 'open') {
@@ -940,30 +1047,77 @@ const JoinRoomPage = () => {
     }
   };
 
-  // Resend chunks
-  const resendChunks = async (dc, indices) => {
-    const buffer = senderBufferRef.current;
-    if (!buffer) return;
+  // Resend specific chunk indices asked by receiver
+  const resendChunks = async (dc, indices, file, key, iv) => {
+    if (!file) return;
     
-    const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const forceFallback = !crypto.subtle || currentRoomRef.current?.isLocal;
     
+    dc.bufferedAmountLowThreshold = 65536; // 64KB
+    const waitForDrain = () => new Promise(resolve => {
+      if (dc.bufferedAmount <= dc.bufferedAmountLowThreshold) {
+        resolve();
+        return;
+      }
+      
+      let resolved = false;
+      const onLow = () => {
+        if (resolved) return;
+        resolved = true;
+        dc.removeEventListener('bufferedamountlow', onLow);
+        resolve();
+      };
+      
+      dc.addEventListener('bufferedamountlow', onLow);
+      
+      const check = () => {
+        if (resolved) return;
+        if (dc.readyState !== 'open') {
+          resolved = true;
+          dc.removeEventListener('bufferedamountlow', onLow);
+          resolve();
+          return;
+        }
+        if (dc.bufferedAmount <= dc.bufferedAmountLowThreshold) {
+          resolved = true;
+          dc.removeEventListener('bufferedamountlow', onLow);
+          resolve();
+        } else {
+          setTimeout(check, 50);
+        }
+      };
+      setTimeout(check, 50);
+    });
+
     for (const index of indices) {
       if (dc.readyState !== 'open') return;
       
-      const offset = index * CHUNK_SIZE;
-      const size = Math.min(CHUNK_SIZE, buffer.byteLength - offset);
-      const chunkData = buffer.slice(offset, offset + size);
+      await waitForDrain();
+      if (dc.readyState !== 'open') return;
       
-      const messageBuffer = new ArrayBuffer(8 + chunkData.byteLength);
+      const offset = index * CHUNK_SIZE;
+      const size = Math.min(CHUNK_SIZE, file.size - offset);
+      const blobSlice = file.slice(offset, offset + size);
+      
+      let chunkData;
+      try {
+        chunkData = await blobSlice.arrayBuffer();
+      } catch (err) {
+        console.error('Failed to read chunk for resend:', err);
+        continue;
+      }
+      
+      const chunkIv = deriveChunkIv(iv, index);
+      const encryptedChunk = await encryptBuffer(chunkData, key, chunkIv, forceFallback);
+      
+      const messageBuffer = new ArrayBuffer(8 + encryptedChunk.byteLength);
       const view = new DataView(messageBuffer);
       view.setUint32(0, index);
       view.setUint32(4, totalChunks);
-      
       const payload = new Uint8Array(messageBuffer);
-      payload.set(new Uint8Array(chunkData), 8);
-      
+      payload.set(new Uint8Array(encryptedChunk), 8);
       dc.send(messageBuffer);
-      await new Promise(resolve => setTimeout(resolve, 10));
     }
     
     if (dc.readyState === 'open') {
@@ -974,6 +1128,30 @@ const JoinRoomPage = () => {
   const handleRejectRequest = (request) => {
     setPendingRequests(prev => prev.filter(r => !(r.fileId === request.fileId && r.requesterId === request.requesterId)));
     setTransferStatus(`Rejected request from ${request.requesterName}`);
+    setTimeout(() => setTransferStatus(''), 3000);
+    // Notify the receiver their request was rejected
+    socketRef.current?.emit('file:reject', {
+      requesterId: request.requesterId,
+      fileId: request.fileId,
+      fileName: myOfferedFiles.find(f => f.id === request.fileId)?.name || request.fileId
+    });
+  };
+
+  // Sender retracts a file offer from the room
+  const handleRetractOffer = (offeredFile) => {
+    if (!socket || !currentRoom) return;
+    socket.emit('file:remove', {
+      roomId: currentRoom.id,
+      fileId: offeredFile.id,
+      fileName: offeredFile.name
+    });
+    setMyOfferedFiles(prev => prev.filter(f => f.id !== offeredFile.id));
+    if (selectedFile?.name === offeredFile.name) {
+      setSelectedFile(null);
+      setFileShared(false);
+    }
+    setTransferStatus(`Retracted: ${offeredFile.name}`);
+    setTimeout(() => setTransferStatus(''), 2500);
   };
 
   const copyShareUrl = () => {
@@ -1094,6 +1272,16 @@ const JoinRoomPage = () => {
 
   return (
     <div className={`min-h-screen ${theme.background} pt-24 pb-12`}>
+      {/* Custom confirmation modal */}
+      <ConfirmModal
+        open={confirmModal.open}
+        title={confirmModal.title}
+        message={confirmModal.message}
+        danger={confirmModal.danger}
+        confirmLabel={confirmModal.confirmLabel}
+        onConfirm={confirmModal.onConfirm}
+        onCancel={() => setConfirmModal(m => ({ ...m, open: false }))}
+      />
       {/* Password Prompt modal */}
       {showPasswordPrompt && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4">
@@ -1269,6 +1457,31 @@ const JoinRoomPage = () => {
               </div>
             )}
 
+            {/* Sender Section: My Shared Files (with retract button) */}
+            {myOfferedFiles.length > 0 && (
+              <div className={`${theme.card} border rounded-xl p-6 shadow-md`}>
+                <h2 className={`text-lg font-bold ${theme.text} mb-4`}>My Shared Files</h2>
+                <div className="space-y-3">
+                  {myOfferedFiles.map(f => (
+                    <div key={f.id} className={`p-3 ${theme.secondary} rounded-lg flex items-center justify-between gap-3`}>
+                      <div className="min-w-0 flex-1">
+                        <p className={`${theme.text} font-semibold text-sm truncate`}>{f.name}</p>
+                        <p className={`${theme.textSecondary} text-xs`}>{(f.size / 1024 / 1024).toFixed(2)} MB</p>
+                      </div>
+                      <button
+                        onClick={() => handleRetractOffer(f)}
+                        title="Retract this file offer"
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-600/80 hover:bg-rose-700 text-white text-xs font-bold rounded-lg transition-all shrink-0"
+                      >
+                        <X className="h-3 w-3" />
+                        Retract
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Pending Requests (only visible to sender) */}
             {pendingRequests.length > 0 && (
               <div className={`${theme.card} border rounded-xl p-8 shadow-md`}>
@@ -1425,6 +1638,41 @@ const JoinRoomPage = () => {
                   <div className="flex items-center space-x-2 pt-2 border-t border-gray-700/50">
                     <Users className="h-4 w-4 text-gray-500" />
                     <span className={`${theme.textSecondary} text-sm`}>{roomUsers.length} connected</span>
+                  </div>
+
+                  {/* Room action buttons */}
+                  <div className="flex flex-col gap-2 pt-3 border-t border-gray-700/50">
+                    {user && currentRoom && currentRoom.creator === user.id ? (
+                      <button
+                        onClick={() => setConfirmModal({
+                          open: true,
+                          title: 'Close Room',
+                          message: 'All connected users will be disconnected and the room will be permanently deleted.',
+                          danger: true,
+                          confirmLabel: 'Close Room',
+                          onConfirm: () => { closeRoom(); setConfirmModal(m => ({ ...m, open: false })); }
+                        })}
+                        className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-rose-600/90 hover:bg-rose-700 text-white rounded-xl text-sm font-bold transition-all shadow-md transform active:scale-95"
+                      >
+                        <DoorOpen className="h-4 w-4" />
+                        Close Room
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmModal({
+                          open: true,
+                          title: 'Leave Room',
+                          message: 'You will leave this room. You can rejoin later if the room is still active.',
+                          danger: false,
+                          confirmLabel: 'Leave Room',
+                          onConfirm: () => { leaveRoom(); navigate('/'); setConfirmModal(m => ({ ...m, open: false })); }
+                        })}
+                        className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-gray-700 hover:bg-gray-600 text-white rounded-xl text-sm font-bold transition-all shadow-md transform active:scale-95"
+                      >
+                        <LogOut className="h-4 w-4" />
+                        Leave Room
+                      </button>
+                    )}
                   </div>
                 </div>
               )}

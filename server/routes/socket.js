@@ -3,7 +3,7 @@ import * as transferController from '../controllers/transfer.js';
 import * as signalingController from '../controllers/signaling.js';
 import { startHeartbeat } from '../utils/heartbeat.js';
 import { createUser, deleteUser, getUser, getAllUsers } from '../stores/users.js';
-import { getRoom, deleteRoom } from '../stores/rooms.js';
+import { getRoom, deleteRoom, removeOfferFromRoom } from '../stores/rooms.js';
 
 export default (io) => {
   io.on('connection', (socket) => {
@@ -52,6 +52,25 @@ export default (io) => {
         socket.emit('room:error', { message: 'Room not found or expired' });
       }
     });
+
+    // User voluntarily leaves a room
+    socket.on('room:leave', (roomId) => {
+      const leaveResult = roomController.handleLeaveRoom(socket, roomId);
+      socket.to(roomId).emit('user:left', leaveResult);
+    });
+
+    // Room creator closes the entire room
+    socket.on('room:close', (roomId) => {
+      const room = getRoom(roomId);
+      if (!room) return;
+      // Only the creator can close the room
+      if (room.creator !== socket.id) {
+        socket.emit('room:error', { message: 'Only the room creator can close the room.' });
+        return;
+      }
+      io.to(roomId).emit('room:destroyed', { message: 'The room creator has closed this room.' });
+      deleteRoom(roomId);
+    });
     
     // File transfer
     socket.on('file:offer', (data) => {
@@ -59,6 +78,14 @@ export default (io) => {
       if (result) {
         socket.to(data.roomId).emit('file:offered', result);
       }
+    });
+
+    // Sender retracts a file offer — remove from room and notify all members
+    socket.on('file:remove', (data) => {
+      const { roomId, fileId, fileName } = data;
+      removeOfferFromRoom(roomId, fileId);
+      // Notify all room members (including sender) to remove this file
+      io.to(roomId).emit('file:removed', { fileId, fileName });
     });
     
     socket.on('file:request', (data) => {
@@ -69,6 +96,12 @@ export default (io) => {
           senderId: result.senderId
         });
       }
+    });
+
+    // Sender rejected a download request — notify the requester
+    socket.on('file:reject', (data) => {
+      const { requesterId, fileId, fileName } = data;
+      socket.to(requesterId).emit('file:rejected', { fileId, fileName, senderName: getUser(socket.id)?.name });
     });
     
     socket.on('transfer:progress', (data) => {

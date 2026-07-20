@@ -101,3 +101,25 @@ export const shouldCompress = (fileName) => {
   const uncompressible = ['zip', 'rar', '7z', 'jpg', 'jpeg', 'png', 'gif', 'mp4', 'avi', 'mp3', 'wav', 'pdf', 'gz'];
   return !uncompressible.includes(extension);
 };
+
+// Convert a hex string to a Uint8Array (e.g. from stored IV/salt)
+export const hexToBuf = (hex) => {
+  const buf = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < buf.length; i++) {
+    buf[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return buf;
+};
+
+// Derive a per-chunk IV by XOR-ing the base IV with the chunk index.
+// This ensures every chunk is encrypted with a unique nonce while
+// the receiver can reproduce the same IV without extra data in the stream.
+export const deriveChunkIv = (baseIv, chunkIndex) => {
+  const chunkIv = new Uint8Array(baseIv);
+  // Write chunkIndex into the last 4 bytes (big-endian XOR)
+  chunkIv[8]  ^= (chunkIndex >>> 24) & 0xff;
+  chunkIv[9]  ^= (chunkIndex >>> 16) & 0xff;
+  chunkIv[10] ^= (chunkIndex >>>  8) & 0xff;
+  chunkIv[11] ^=  chunkIndex         & 0xff;
+  return chunkIv;
+};

@@ -25,6 +25,8 @@ export const SocketProvider = ({ children }) => {
 
   const pendingRoomIdRef = React.useRef(null);
   const userRef = React.useRef(null);
+  // Track when the disconnect is intentionally caused by switching server URL (local mode)
+  const switchingServerRef = React.useRef(false);
 
   useEffect(() => {
     userRef.current = user;
@@ -42,10 +44,10 @@ export const SocketProvider = ({ children }) => {
       if (userRef.current && userRef.current.name) {
         console.log('Auto-registering user on new server:', userRef.current.name);
         newSocket.emit('user:join', { name: userRef.current.name, uuid: getPersistentUuid() });
-      }
-      
-      if (pendingRoomIdRef.current) {
-        console.log('Automatically joining pending local room:', pendingRoomIdRef.current);
+        // Room join will happen inside user:joined callback after server confirms registration
+      } else if (pendingRoomIdRef.current) {
+        // No existing user — just join the room (anonymous edge case)
+        console.log('No user, joining pending room directly:', pendingRoomIdRef.current);
         newSocket.emit('room:join', pendingRoomIdRef.current);
         pendingRoomIdRef.current = null;
       }
@@ -53,10 +55,14 @@ export const SocketProvider = ({ children }) => {
 
     newSocket.on('disconnect', () => {
       setConnected(false);
-      setUser(null);
-      setCurrentRoom(null);
-      setRoomUsers([]);
-      setRoomError(null);
+      // Only reset user/room if this is a genuine disconnect, not a local-mode server switch
+      if (!switchingServerRef.current) {
+        setUser(null);
+        setCurrentRoom(null);
+        setRoomUsers([]);
+        setRoomError(null);
+      }
+      switchingServerRef.current = false;
       console.log('Disconnected from server');
     });
 
@@ -69,8 +75,14 @@ export const SocketProvider = ({ children }) => {
           return [...prev, data.user];
         });
       } else {
-        // It's the current user's own data
+        // It's the current user's own confirmation — update user state
         setUser(data);
+        // If we were waiting to join a local room, do it now (after user is registered)
+        if (pendingRoomIdRef.current) {
+          console.log('User registered, now joining pending local room:', pendingRoomIdRef.current);
+          newSocket.emit('room:join', pendingRoomIdRef.current);
+          pendingRoomIdRef.current = null;
+        }
       }
     });
 
@@ -108,6 +120,14 @@ export const SocketProvider = ({ children }) => {
     newSocket.on('room:update', (roomData) => {
       console.log('Room update:', roomData);
       setCurrentRoom(roomData);
+    });
+
+    // Room was destroyed (closed by creator or one-time download)
+    newSocket.on('room:destroyed', () => {
+      console.log('Room destroyed by server');
+      setCurrentRoom(null);
+      setRoomUsers([]);
+      setRoomError(null);
     });
 
     setSocket(newSocket);
@@ -153,9 +173,41 @@ export const SocketProvider = ({ children }) => {
   };
 
   const joinLocalRoom = (roomId, ip, port = 3001) => {
-    console.log(`Setting up local join: room=${roomId} at ${ip}:${port}`);
-    pendingRoomIdRef.current = roomId;
-    setServerUrl(`http://${ip}:${port}`);
+    const targetUrl = `http://${ip}:${port}`;
+
+    if (targetUrl === serverUrl && socket && connected) {
+      // Already on the correct server — emit room:join directly (no reconnect needed)
+      console.log('Already on target server, joining room directly:', roomId);
+      setRoomError(null);
+      socket.emit('room:join', roomId);
+    } else if (targetUrl === serverUrl && socket && !connected) {
+      // Same URL but temporarily disconnected — queue the join
+      console.log('Same server, queuing room join for reconnect:', roomId);
+      pendingRoomIdRef.current = roomId;
+    } else {
+      // Need to switch to a different server
+      console.log(`Switching server to ${targetUrl} then joining room:`, roomId);
+      pendingRoomIdRef.current = roomId;
+      switchingServerRef.current = true;
+      setCurrentRoom(null);
+      setServerUrl(targetUrl);
+    }
+  };
+
+  const leaveRoom = () => {
+    if (socket && currentRoom) {
+      socket.emit('room:leave', currentRoom.id);
+    }
+    setCurrentRoom(null);
+    setRoomUsers([]);
+  };
+
+  const closeRoom = () => {
+    if (socket && currentRoom) {
+      socket.emit('room:close', currentRoom.id);
+    }
+    setCurrentRoom(null);
+    setRoomUsers([]);
   };
 
   const value = {
@@ -169,6 +221,8 @@ export const SocketProvider = ({ children }) => {
     createRoom,
     joinRoom,
     joinLocalRoom,
+    leaveRoom,
+    closeRoom,
     serverUrl,
     setServerUrl
   };

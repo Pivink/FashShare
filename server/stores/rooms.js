@@ -65,6 +65,10 @@ export const removeUserFromRoom = (roomId, userId) => {
 export const addOfferToRoom = (roomId, offer) => {
   const room = getRoom(roomId);
   if (room) {
+    // Deduplicate: remove any existing offer from the same sender with the same filename
+    room.offers = room.offers.filter(
+      o => !(o.senderId === offer.senderId && o.fileName === offer.fileName)
+    );
     room.offers.push(offer);
     room.lastActive = Date.now();
   }
